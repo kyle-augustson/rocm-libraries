@@ -69,6 +69,10 @@ option(ROCSOLVER_ENABLE_EIGENSOLVERS_64 "Enable the 64-bit eigensolver API (syev
 option(ROCSOLVER_ENABLE_EIG_2STAGE "Enable 2-stage eigensolver reduction (he2hb + hb2st)" ON)
 option(ROCSOLVER_ENABLE_HESSENBERG "Enable Hessenberg reduction routines (gehrd/gehd2/lahr2)" ON)
 option(ROCSOLVER_ENABLE_XXGHR "Enable orthogonal/unitary matrix generator from Hessenberg reduction (orghr/unghr)" ON)
+option(ROCSOLVER_ENABLE_BALANCE "Enable balancing routines (gebal/gebak)" ON)
+option(ROCSOLVER_ENABLE_HSEQR "Enable the Hessenberg QR eigensolver and Schur reordering (hseqr/trexc)" ON)
+option(ROCSOLVER_ENABLE_TREVC "Enable the eigenvectors of triangular matrices (trevc3)" ON)
+option(ROCSOLVER_ENABLE_GEEV "Enable the eigensolver for general matrices (geev)" ON)
 
 # Add our CMake helper files to the lookup path
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")

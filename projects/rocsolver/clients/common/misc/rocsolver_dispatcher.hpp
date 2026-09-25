@@ -74,6 +74,9 @@
 
 // lapack
 #include "common/lapack/testing_cholqr.hpp"
+#include "common/lapack/testing_gebak.hpp"
+#include "common/lapack/testing_gebal.hpp"
+#include "common/lapack/testing_geev.hpp"
 #include "common/lapack/testing_gebd2_gebrd.hpp"
 #include "common/lapack/testing_geblttrf_npvt.hpp"
 #include "common/lapack/testing_geblttrs_npvt.hpp"
@@ -96,6 +99,7 @@
 #include "common/lapack/testing_getri_outofplace.hpp"
 #include "common/lapack/testing_getrs.hpp"
 #include "common/lapack/testing_getrs_npvt.hpp"
+#include "common/lapack/testing_hseqr.hpp"
 #include "common/lapack/testing_posv.hpp"
 #include "common/lapack/testing_potf2_potrf.hpp"
 #include "common/lapack/testing_potri.hpp"
@@ -117,6 +121,8 @@
 #include "common/lapack/testing_sytrs.hpp"
 #include "common/lapack/testing_sytrs2.hpp"
 #include "common/lapack/testing_sytxx_hetxx.hpp"
+#include "common/lapack/testing_trevc3.hpp"
+#include "common/lapack/testing_trexc.hpp"
 #include "common/lapack/testing_trtri.hpp"
 
 // refactorization
@@ -356,6 +362,14 @@ class rocsolver_dispatcher
             {"gehrd", testing_gehd2_gehrd<false, false, 1, T>},
             {"gehrd_batched", testing_gehd2_gehrd<true, true, 1, T>},
             {"gehrd_strided_batched", testing_gehd2_gehrd<false, true, 1, T>},
+            // gebal
+            {"gebal", testing_gebal<false, false, T>},
+            {"gebal_batched", testing_gebal<true, true, T>},
+            {"gebal_strided_batched", testing_gebal<false, true, T>},
+            // gebak
+            {"gebak", testing_gebak<false, false, T>},
+            {"gebak_batched", testing_gebak<true, true, T>},
+            {"gebak_strided_batched", testing_gebak<false, true, T>},
             // sytrf
             {"sytf2", testing_sytf2_sytrf<false, false, 0, T>},
             {"sytf2_batched", testing_sytf2_sytrf<true, true, 0, T>},
@@ -538,6 +552,22 @@ class rocsolver_dispatcher
             {"unglq", testing_orglx_unglx<T, 1>},
             {"ungbr", testing_orgbr_ungbr<T>},
             {"unghr", testing_orghr_unghr<T>},
+            // hseqr
+            {"hseqr", testing_hseqr<false, false, T>},
+            {"hseqr_batched", testing_hseqr<true, true, T>},
+            {"hseqr_strided_batched", testing_hseqr<false, true, T>},
+            // trexc
+            {"trexc", testing_trexc<false, false, T>},
+            {"trexc_batched", testing_trexc<true, true, T>},
+            {"trexc_strided_batched", testing_trexc<false, true, T>},
+            // trevc3
+            {"trevc3", testing_trevc3<false, false, T>},
+            {"trevc3_batched", testing_trevc3<true, true, T>},
+            {"trevc3_strided_batched", testing_trevc3<false, true, T>},
+            // geev
+            {"geev", testing_geev<false, false, T>},
+            {"geev_batched", testing_geev<true, true, T>},
+            {"geev_strided_batched", testing_geev<false, true, T>},
             {"ungtr", testing_orgtr_ungtr<T>},
             // unmxx
             {"unm2r", testing_ormxr_unmxr<T, 0>},

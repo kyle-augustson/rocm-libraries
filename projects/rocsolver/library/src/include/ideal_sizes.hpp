@@ -270,6 +270,95 @@
 #define GEHRD_GEHD2_SWITCHSIZE 512
 #endif
 
+/***************** gebal **********************************************
+*******************************************************************************/
+/*! \brief Determines the number of threads of the thread-block that balances
+    each matrix (GEBAL). Also applies to the corresponding batched and
+    strided-batched routines.
+
+    \details GEBAL follows the sequential order of LAPACK; each matrix is processed
+    by a single thread-block, and the entries of a row or column are distributed
+    among its threads. It must be a multiple of 64.*/
+#ifndef GEBAL_BLOCKSIZE
+#define GEBAL_BLOCKSIZE 256
+#endif
+
+/***************** hseqr **********************************************
+*******************************************************************************/
+/*! \brief Determines the number of threads of the thread-block that computes
+    the Schur form of each Hessenberg matrix (HSEQR). Also applies to the
+    corresponding batched and strided-batched routines.
+
+    \details Each matrix is processed by a single thread-block; the scalar
+    computations are sequential, as in LAPACK, and the updates of rows and
+    columns of H and Z are distributed among the threads. It must be a multiple of 64.*/
+#ifndef HSEQR_BLOCKSIZE
+#define HSEQR_BLOCKSIZE 256
+#endif
+
+/*! \brief Order of the largest matrix processed by HSEQR with the single-shift QR
+    algorithm (ZLAHQR); larger matrices use the multishift QR algorithm with aggressive
+    early deflation (ZLAQR0). As in LAPACK (IPARMQ, ISPEC = 12). */
+#ifndef HSEQR_NMIN
+#define HSEQR_NMIN 75
+#endif
+
+/*! \brief Maximum number of simultaneous shifts of the multishift QR sweeps of HSEQR
+    (the largest value recommended by LAPACK IPARMQ is 256). */
+#ifndef HSEQR_MAX_SHIFTS
+#define HSEQR_MAX_SHIFTS 256
+#endif
+
+/*! \brief Number of threads of the thread-block that chases the bulges of the
+    multishift QR sweeps of HSEQR. It must be a multiple of 64.*/
+#ifndef HSEQR_CHASE_BLOCKSIZE
+#define HSEQR_CHASE_BLOCKSIZE 1024
+#endif
+
+/*! \brief Maximum size of the (initial) deflation window of the aggressive early
+    deflation in HSEQR, or 0 to use the size recommended by LAPACK IPARMQ.
+
+    \details The Schur form of the window is computed by a single thread-block, so
+    that large windows are expensive on the GPU. The default was measured on MI300X
+    (n = 2000: 5.0 s with the IPARMQ window of 96, 3.5 s with 64); it deviates from
+    LAPACK, which uses windows of NS or 3*NS/2 entries (NS = number of shifts).
+    (The window may still grow beyond this value after several iterations without
+    deflations, as in LAPACK.)*/
+#ifndef HSEQR_AED_WINDOW_MAX
+#define HSEQR_AED_WINDOW_MAX 64
+#endif
+
+/***************** trexc **********************************************
+*******************************************************************************/
+/*! \brief Determines the number of threads of the thread-block that reorders
+    the Schur form of each matrix (TREXC). Also applies to the corresponding
+    batched and strided-batched routines. It must be a multiple of 64.*/
+#ifndef TREXC_BLOCKSIZE
+#define TREXC_BLOCKSIZE 256
+#endif
+
+/***************** trevc3 *********************************************
+*******************************************************************************/
+/*! \brief Determines the number of threads of the thread-blocks of TREVC3 (one
+    thread per eigenvector in the triangular solves). Also applies to the
+    corresponding batched and strided-batched routines. It must be a power of 2.*/
+#ifndef TREVC3_BLOCKSIZE
+#define TREVC3_BLOCKSIZE 256
+#endif
+
+/*! \brief Determines the size of the diagonal blocks of T in the triangular solves
+    of TREVC3 (they are kept in shared memory, and each thread keeps a vector of
+    this size).*/
+#ifndef TREVC3_NB
+#define TREVC3_NB 32
+#endif
+
+/*! \brief Determines the number of eigenvectors that TREVC3 computes (and
+    back-transforms) at a time.*/
+#ifndef TREVC3_NC
+#define TREVC3_NC 256
+#endif
+
 /***************** sygs2/sygst and hegs2/hegst ********************************
 *******************************************************************************/
 /*! \brief Determines the size of the leading block that is reduced to standard form at each step

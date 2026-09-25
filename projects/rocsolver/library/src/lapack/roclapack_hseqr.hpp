@@ -1,0 +1,949 @@
+/************************************************************************
+ * Derived from the BSD3-licensed
+ * LAPACK routine (version 3.12.0) --
+ *     Univ. of Tennessee, Univ. of California Berkeley,
+ *     Univ. of Colorado Denver and NAG Ltd..
+ *     November 2023
+ * Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ * *************************************************************************/
+
+#pragma once
+
+#include "auxiliary/rocauxiliary_lahqr.hpp"
+#include "auxiliary/rocauxiliary_laqr.hpp"
+#include "rocblas.hpp"
+#include "rocsolver/rocsolver.h"
+
+#include <cmath>
+#include <vector>
+
+ROCSOLVER_BEGIN_NAMESPACE
+
+/** HSEQR_NONFINITE_BLOCK returns whether the Hessenberg part of the diagonal block
+    H(ilo:ihi, ilo:ihi) of H contains a NaN or an infinite entry (all the threads of the
+    thread-block must call it). **/
+template <int BS, typename T, typename I>
+__device__ bool hseqr_nonfinite_block(const I ilo, const I ihi, const T* H, const I ldh)
+{
+    const I nh = ihi - ilo + 1;
+    int bad = 0;
+    for(I j = 0; j < nh && !bad; j++)
+        for(I i = hipThreadIdx_x; i <= std::min(j + 1, nh - 1); i += BS)
+        {
+            const T h = H[idx2D(ilo - 1 + i, ilo - 1 + j, ldh)];
+            if(!std::isfinite(h.real()) || !std::isfinite(h.imag()))
+                bad = 1;
+        }
+    return __syncthreads_or(bad) != 0;
+}
+
+/** HSEQR_NONFINITE_BOTTOM splits the active block ilo:ihi of the upper Hessenberg matrix H
+    into irreducible diagonal blocks at the exactly zero subdiagonal entries H(k+1,k), and
+    returns the last row (1-based) of the lowest block of size > 1 whose Hessenberg part
+    contains a NaN or an infinite entry, or 0 if there is none (all the threads of the
+    thread-block must call it). The QR algorithm cannot converge on such a block (LAPACK
+    would iterate until its iteration limit); the blocks below it do not depend on it, and
+    the entries outside the diagonal blocks do not affect the convergence. A 1x1 block
+    deflates at once (as in ZLAHQR, or in the deflation window of ZLAQR0): its diagonal
+    entry is its eigenvalue, even if it is a NaN or infinite. **/
+template <int BS, typename T, typename I>
+__device__ I hseqr_nonfinite_bottom(const I ilo, const I ihi, const T* H, const I ldh)
+{
+    // blocks from the bottom (the subdiagonal entries are read by all the threads)
+    I bot = ihi;
+    while(bot >= ilo)
+    {
+        I top = bot;
+        while(top > ilo && !(H[idx2D(top - 1, top - 2, ldh)] == T(0)))
+            top--;
+        // (top and bot are the same for all the threads)
+        if(top < bot && hseqr_nonfinite_block<BS>(top, bot, H, ldh))
+            return bot;
+        bot = top - 1;
+    }
+    return 0;
+}
+
+/** HSEQR_SET_NONFINITE sets the eigenvalues ilo:ihi to NaN (the rows of the diagonal
+    blocks with NaN or infinite entries and those above them). **/
+template <int BS, typename T, typename I>
+__device__ void hseqr_set_nonfinite(const I ilo, const I ihi, T* W)
+{
+    using S = decltype(std::real(T{}));
+    const S nan = std::numeric_limits<S>::quiet_NaN();
+    for(I j = ilo - 1 + hipThreadIdx_x; j < ihi; j += BS)
+        W[j] = T(nan, nan);
+}
+
+/** HSEQR_CHECK_KERNEL finds, for each matrix of the batch (multishift path), the last row
+    ibad of the lowest diagonal block of size > 1 of the active block with a NaN or an
+    infinite entry (see hseqr_nonfinite_bottom); if there is one, the eigenvalues W(ilo:ibad)
+    are set to NaN (and W(ihi) = H(ihi,ihi) if ibad = ihi-1: the 1x1 block ihi is left, and
+    there is nothing to iterate on).
+    flag is set to ibad, or to 0 if there is no such block. **/
+template <int BS, typename T, typename I, typename UH>
+ROCSOLVER_KERNEL void __launch_bounds__(BS) hseqr_check_kernel(const I n,
+                                                               const I* iloA,
+                                                               const I* ihiA,
+                                                               UH HH,
+                                                               const rocblas_stride shiftH,
+                                                               const I ldh,
+                                                               const rocblas_stride strideH,
+                                                               T* WW,
+                                                               const rocblas_stride strideW,
+                                                               I* flag)
+{
+    const I bid = hipBlockIdx_x;
+    const I ilo = std::min(std::max(iloA[bid], I(1)), n);
+    const I ihi = std::min(std::max(ihiA[bid], ilo), n);
+    const T* H = load_ptr_batch<T>(HH, bid, shiftH, strideH);
+    T* W = WW + rocblas_stride(bid) * strideW;
+    // (with ilo = ihi there is nothing to iterate on, as in the small-size kernel)
+    const I ibad = (ilo < ihi) ? hseqr_nonfinite_bottom<BS>(ilo, ihi, H, ldh) : I(0);
+    if(ibad > 0)
+    {
+        hseqr_set_nonfinite<BS>(ilo, ibad, W);
+        if(ibad == ihi - 1 && hipThreadIdx_x == 0)
+            W[ihi - 1] = H[idx2D(ihi - 1, ihi - 1, ldh)];
+    }
+    if(hipThreadIdx_x == 0)
+        flag[bid] = ibad;
+}
+
+/** HSEQR_KERNEL computes the eigenvalues and, optionally, the Schur form and
+    Schur vectors of each Hessenberg matrix in the batch, following LAPACK ZHSEQR.
+    Each matrix is processed by a single thread-block of BS threads with the
+    single-shift algorithm of ZLAHQR. It is used for n <= HSEQR_NMIN (75, as in
+    LAPACK); larger matrices use the multishift algorithm (hseqr_multishift). **/
+template <int BS, typename T, typename I, typename UH, typename UZ>
+ROCSOLVER_KERNEL void __launch_bounds__(BS) hseqr_kernel(const rocsolver_schur_job job,
+                                                         const rocsolver_schur_vectors compz,
+                                                         const I n,
+                                                         const I* iloA,
+                                                         const I* ihiA,
+                                                         UH HH,
+                                                         const rocblas_stride shiftH,
+                                                         const I ldh,
+                                                         const rocblas_stride strideH,
+                                                         T* WW,
+                                                         const rocblas_stride strideW,
+                                                         UZ ZZ,
+                                                         const rocblas_stride shiftZ,
+                                                         const I ldz,
+                                                         const rocblas_stride strideZ,
+                                                         I* infoA)
+{
+    const I bid = hipBlockIdx_x;
+    const I tid = hipThreadIdx_x;
+
+    // quick return
+    if(n == 0)
+    {
+        if(tid == 0)
+            infoA[bid] = 0;
+        return;
+    }
+
+    const bool wantt = (job == rocsolver_schur_form);
+    const bool initz = (compz == rocsolver_schur_vectors_initialize);
+    const bool wantz = initz || (compz == rocsolver_schur_vectors_update);
+
+    T* H = load_ptr_batch<T>(HH, bid, shiftH, strideH);
+    T* W = WW + rocblas_stride(bid) * strideW;
+    T* Z = wantz ? load_ptr_batch<T>(ZZ, bid, shiftZ, strideZ) : nullptr;
+    auto h = [&](const I i, const I j) -> T& { return H[idx2D(i - 1, j - 1, ldh)]; };
+
+    // ilo and ihi are read from device memory and cannot be validated on the host;
+    // they are clamped to a valid range (1 <= ilo <= ihi <= n)
+    const I ilo = std::min(std::max(iloA[bid], I(1)), n);
+    const I ihi = std::min(std::max(ihiA[bid], ilo), n);
+
+    __shared__ I s_red[2][BS / 32];
+    int buf = 0;
+
+    // copy eigenvalues isolated by GEBAL
+    for(I j = 1 + tid; j <= n; j += BS)
+        if(j < ilo || j > ihi)
+            W[j - 1] = h(j, j);
+
+    // initialize Z, if requested
+    if(initz)
+    {
+        for(I j = 0; j < n; j++)
+            for(I r = tid; r < n; r += BS)
+                Z[idx2D(r, j, ldz)] = (r == j) ? T(1) : T(0);
+    }
+    __syncthreads();
+
+    // quick return if possible (as in LAPACK, H is not cleaned up in this case)
+    if(ilo == ihi)
+    {
+        if(tid == 0)
+        {
+            W[ilo - 1] = h(ilo, ilo);
+            infoA[bid] = 0;
+        }
+        return;
+    }
+
+    // a NaN or an infinite entry in a diagonal block of size > 1 of the active block (split
+    // at the exactly zero subdiagonal entries): the rows ibad+1:ihi below the lowest such block
+    // are processed as usual (H(ibad+1, ibad) = 0), and info = ibad if they converge,
+    // with W(ilo:ibad) = NaN (LAPACK would iterate on that block until its iteration limit)
+    const I ibad = hseqr_nonfinite_bottom<BS>(ilo, ihi, H, ldh);
+    I info = 0;
+    if(ibad > 0)
+        hseqr_set_nonfinite<BS>(ilo, ibad, W);
+    if(ibad < ihi)
+        info = lahqr_block<BS>(wantt, wantz, n, ibad > 0 ? ibad + 1 : ilo, ihi, H, ldh, W, ilo, ihi,
+                               Z, ldz, s_red, buf);
+    if(info == 0)
+        info = ibad;
+    __syncthreads();
+
+    // clear out the trash, if necessary
+    if((wantt || info != 0) && n > 2)
+    {
+        for(I j = 1; j <= n - 2; j++)
+            for(I r = j + 2 + tid; r <= n; r += BS)
+                h(r, j) = T(0);
+    }
+
+    if(tid == 0)
+        infoA[bid] = info;
+}
+
+/** HSEQR_PREPARE_KERNEL performs the first steps of ZHSEQR for the multishift path:
+    it copies the eigenvalues isolated by GEBAL into W, initializes Z if requested,
+    and handles the case ilo = ihi. **/
+template <typename T, typename I, typename UH, typename UZ>
+ROCSOLVER_KERNEL void hseqr_prepare_kernel(const rocsolver_schur_vectors compz,
+                                           const I n,
+                                           const I* iloA,
+                                           const I* ihiA,
+                                           UH HH,
+                                           const rocblas_stride shiftH,
+                                           const I ldh,
+                                           const rocblas_stride strideH,
+                                           T* WW,
+                                           const rocblas_stride strideW,
+                                           UZ ZZ,
+                                           const rocblas_stride shiftZ,
+                                           const I ldz,
+                                           const rocblas_stride strideZ)
+{
+    const I bid = hipBlockIdx_y;
+    const I tid = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
+    const I nthreads = hipGridDim_x * hipBlockDim_x;
+    const bool initz = (compz == rocsolver_schur_vectors_initialize);
+
+    T* H = load_ptr_batch<T>(HH, bid, shiftH, strideH);
+    T* W = WW + rocblas_stride(bid) * strideW;
+    const I ilo = std::min(std::max(iloA[bid], I(1)), n);
+    const I ihi = std::min(std::max(ihiA[bid], ilo), n);
+
+    for(I j = 1 + tid; j <= n; j += nthreads)
+        if(j < ilo || j > ihi || ilo == ihi)
+            W[j - 1] = H[idx2D(j - 1, j - 1, ldh)];
+
+    if(initz)
+    {
+        T* Z = load_ptr_batch<T>(ZZ, bid, shiftZ, strideZ);
+        for(I j = 0; j < n; j++)
+            for(I r = tid; r < n; r += nthreads)
+                Z[idx2D(r, j, ldz)] = (r == j) ? T(1) : T(0);
+    }
+}
+
+/** HSEQR_FINISH_KERNEL clears out the trash below the first subdiagonal of H (if
+    needed, as in ZHSEQR) and sets info for one matrix. **/
+template <typename T, typename I>
+ROCSOLVER_KERNEL void
+    hseqr_finish_kernel(const bool clean, const I n, T* H, const I ldh, I* info, const I infoval)
+{
+    const I tid = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
+    const I nthreads = hipGridDim_x * hipBlockDim_x;
+    if(clean && n > 2)
+        for(I j = 1; j <= n - 2; j++)
+            for(I r = j + 2 + tid; r <= n; r += nthreads)
+                H[idx2D(r - 1, j - 1, ldh)] = T(0);
+    if(tid == 0)
+        *info = infoval;
+}
+
+template <int BS, typename T, typename I>
+ROCSOLVER_KERNEL void __launch_bounds__(BS) laqr0_iteration_kernel(const I n,
+                                                                   const I ilo,
+                                                                   const I kbot,
+                                                                   const I ndfl,
+                                                                   const I nw,
+                                                                   const I ndec,
+                                                                   const I nwr,
+                                                                   const I nwmax,
+                                                                   const I nsr,
+                                                                   const I nsmax,
+                                                                   T* H,
+                                                                   const I ldh,
+                                                                   T* W,
+                                                                   I* status,
+                                                                   T* statusT)
+{
+    laqr0_iteration_block<BS>(n, ilo, kbot, ndfl, nw, ndec, nwr, nwmax, nsr, nsmax, H, ldh, W,
+                              status, statusT);
+}
+
+/** LAQR0_PART1_KERNEL and LAQR0_PART2_KERNEL run the device parts of one iteration
+    of the multishift QR algorithm in hybrid mode (the core of the aggressive early
+    deflation runs on the host in between). **/
+template <int BS, typename T, typename I>
+ROCSOLVER_KERNEL void __launch_bounds__(BS) laqr0_part1_kernel(const I n,
+                                                               const I ilo,
+                                                               const I kbot,
+                                                               const I ndfl,
+                                                               const I nw,
+                                                               const I ndec,
+                                                               const I nwr,
+                                                               const I nwmax,
+                                                               T* H,
+                                                               const I ldh,
+                                                               T* W,
+                                                               I* status,
+                                                               T* statusT)
+{
+    __shared__ I s_ired[2][HQR_RED(BS)];
+    int ibuf = 0;
+    laqr0_part1_block<BS>(n, ilo, kbot, ndfl, nw, ndec, nwr, nwmax, H, ldh, W, status, statusT,
+                          s_ired, ibuf);
+}
+
+template <int BS, typename T, typename I>
+ROCSOLVER_KERNEL void __launch_bounds__(BS) laqr0_part2_kernel(const I n,
+                                                               const I kbot,
+                                                               const I ndfl,
+                                                               const I nwmax,
+                                                               const I nsr,
+                                                               const I nsmax,
+                                                               T* H,
+                                                               const I ldh,
+                                                               T* W,
+                                                               I* status,
+                                                               T* statusT)
+{
+    __shared__ I s_ired[2][HQR_RED(BS)];
+    int ibuf = 0;
+    laqr0_part2_block<BS>(n, kbot, ndfl, nwmax, nsr, nsmax, H, ldh, W, status, statusT, s_ired, ibuf);
+}
+
+template <int BS, typename T, typename I>
+ROCSOLVER_KERNEL void __launch_bounds__(BS)
+    laqr0_toofew_kernel(const I n, T* H, const I ldh, T* W, I* status)
+{
+    __shared__ I s_ired[2][HQR_RED(BS)];
+    int ibuf = 0;
+    laqr0_toofew_block<BS>(n, H, ldh, W, status, s_ired, ibuf);
+}
+
+template <int BS, typename T, typename I>
+ROCSOLVER_KERNEL void __launch_bounds__(BS) laqr5_chunk_kernel(const bool wantt,
+                                                               const bool wantz,
+                                                               const bool accum,
+                                                               const I n,
+                                                               const I ktop,
+                                                               const I kbot,
+                                                               const I nbmps,
+                                                               const I incol,
+                                                               const T* sh,
+                                                               T* H,
+                                                               const I ldh,
+                                                               const I iloz,
+                                                               const I ihiz,
+                                                               T* Z,
+                                                               const I ldz,
+                                                               T* U,
+                                                               const I ldu)
+{
+    __shared__ T sV[HSEQR_MAX_SHIFTS / 2 + 2][3];
+    laqr5_chunk_block<BS>(wantt, wantz, accum, n, ktop, kbot, nbmps, incol, sh, H, ldh, iloz, ihiz,
+                          Z, ldz, U, ldu, sV);
+}
+
+/** HSEQR_IPARMQ returns the number of shifts (ISPEC = 15) and the deflation window
+    size (ISPEC = 13) recommended by LAPACK IPARMQ for an active block of order nh. **/
+template <typename I>
+void hseqr_iparmq(const I nh, I& ns, I& nw)
+{
+    ns = 2;
+    if(nh >= 30)
+        ns = 4;
+    if(nh >= 60)
+        ns = 10;
+    if(nh >= 150)
+        ns = std::max(I(10), I(nh / I(std::lround(std::log(double(nh)) / std::log(2.0)))));
+    if(nh >= 590)
+        ns = 64;
+    if(nh >= 3000)
+        ns = 128;
+    if(nh >= 6000)
+        ns = 256;
+    ns = std::max(I(2), ns - ns % 2);
+    nw = (nh <= 500) ? ns : 3 * ns / 2;
+}
+
+/** HSEQR_MULTISHIFT computes the Schur form of one Hessenberg matrix with the
+    multishift QR algorithm with aggressive early deflation of LAPACK ZLAQR0. The
+    control flow runs on the host; each iteration launches one kernel (active block,
+    deflation window, AED and shifts), reads back a small status array, and then
+    launches the off-window updates of the AED and the chunks of the sweep, with
+    their matrix-matrix products. As in LAPACK, the workspace of these steps is the
+    part of H below its first subdiagonal. Returns info (0 or kbot > 0 in case of
+    failure, as in LAPACK).
+
+    In hybrid mode, the core of the aggressive early deflation (the Schur form of the
+    deflation window, the deflation tests and the return to Hessenberg form) runs on
+    the host, with the same code as on the device: the window is copied to the host
+    and back in each iteration. **/
+template <typename T, typename I>
+I hseqr_multishift(rocblas_handle handle,
+                   const bool wantt,
+                   const bool wantz,
+                   const I n,
+                   const I ilo,
+                   const I ihi,
+                   T* H,
+                   const I ldh,
+                   T* W,
+                   const I iloz,
+                   const I ihiz,
+                   T* Z,
+                   const I ldz,
+                   I* dstatus,
+                   T* dstatusT,
+                   const bool hybrid)
+{
+    using S = decltype(std::real(T{}));
+    hipStream_t stream;
+    rocblas_get_stream(handle, &stream);
+    rocblas_pointer_mode_saver saver(handle, rocblas_pointer_mode_host);
+
+    const T one = T(1);
+    const T zero = T(0);
+
+    // C (m-by-k) = op(A) * B through the scratch W (ldw), then copied back into C
+    auto gemm_copy = [&](rocblas_operation transA, const I m, const I nn, const I k, T* A,
+                         const I lda, T* B, const I ldb, T* C, const I ldc, T* Ws, const I ldw) {
+        if(m <= 0 || nn <= 0)
+            return;
+        rocblasCall_gemm(handle, transA, rocblas_operation_none, m, nn, k, &one, A, 0, lda, 0, B, 0,
+                         ldb, 0, &zero, Ws, 0, ldw, 0, I(1), (T**)nullptr);
+        const I blocksx = (m - 1) / BS2 + 1;
+        const I blocksy = (nn - 1) / BS2 + 1;
+        ROCSOLVER_LAUNCH_KERNEL((copy_mat<T, T*, T*>), dim3(blocksx, blocksy, 1), dim3(BS2, BS2), 0,
+                                stream, m, nn, Ws, 0, ldw, 0, C, 0, ldc, 0);
+    };
+    auto h = [&](const I i, const I j) -> T* { return H + idx2D(i - 1, j - 1, ldh); };
+    auto z = [&](const I i, const I j) -> T* { return Z + idx2D(i - 1, j - 1, ldz); };
+
+    // tuning parameters (LAPACK IPARMQ and ZLAQR0 3.9.0, with an unlimited LWORK)
+    const I nhfull = ihi - ilo + 1;
+    I ns_ip, nw_ip;
+    hseqr_iparmq(nhfull, ns_ip, nw_ip);
+    const bool accum = (ns_ip >= 14); // KACC22 = 2 (same as 1 here) when NS >= 14, else 0
+    const I nwr = std::min(nhfull, std::min((n - 1) / 3, std::max(I(2), nw_ip)));
+    I nsr = std::min(ns_ip, std::min((n + 6) / 9, ihi - ilo));
+    nsr = std::max(I(2), nsr - nsr % 2);
+    nsr = std::min(nsr, I(HSEQR_MAX_SHIFTS));
+    const I nwmax = (n - 1) / 3;
+    I nsmax = (n + 6) / 9;
+    nsmax = std::min(nsmax - nsmax % 2, I(HSEQR_MAX_SHIFTS));
+    const I itmax = 30 * std::max(I(10), nhfull);
+
+    // deflation window size: the value recommended by IPARMQ, capped by
+    // HSEQR_AED_WINDOW_MAX (see ideal_sizes.hpp). The number of shifts is capped
+    // likewise: with more shifts than the window can provide, every sweep would get
+    // the missing ones from ZLAHQR on an ns-by-ns trailing submatrix (a slow,
+    // sequential step on the device)
+    I nwr_t = nwr;
+    I nsr_t = nsr;
+    if(HSEQR_AED_WINDOW_MAX > 0)
+    {
+        nwr_t = std::min(nwr_t, I(HSEQR_AED_WINDOW_MAX));
+        nsr_t = std::min(nsr_t, nwr_t);
+        nsr_t = std::max(I(2), nsr_t - nsr_t % 2);
+    }
+
+    I nw = nwmax;
+    I ndec = -1;
+    I ndfl = 1;
+    I kbot = ihi;
+    I st[LAQR0_STATUS_SIZE];
+    T stT[LAQR0_STATUS_SCALAR_SIZE];
+    // host workspace of the hybrid mode (pageable, as the other hybrid algorithms)
+    std::vector<T> hT, hV, hWsh, hwork, hB, hWs;
+
+    // Workspace. As in LAPACK, all the scratch arrays of an iteration live in H below
+    // its first subdiagonal (entries (i,j) with i >= j + 2), which is not part of the
+    // Hessenberg matrix; nw <= (n-1)/3 and ns <= (n+6)/9 keep them there. In stream
+    // order, with the lifetime of each region:
+    //  1. part1 (AED setup) -> off-window updates of the AED (step 3):
+    //     T  = H(kv:kv+jw-1, kt:kt+jw-1), the window (dead after part2 writes it back),
+    //     V  = H(kv:kv+jw-1, 1:jw),       its Schur vectors (read in step 3),
+    //     with kv = n-nw+1, kt = nw+1 (in hybrid mode T and V are also copied to and
+    //     from the host around the AED core).
+    //  2. AED core (device or host):
+    //     work = H(kwv:kwv+jw-1, 1), kwv = nw+2 (rows nw+2:2nw+1 < kv, disjoint from V).
+    //  3. off-window updates of the AED (host-ordered GEMMs, after part2):
+    //     reads V; scratch WV = H(kwv:kv-1, 1:jw) (rows < kv) and WH = H(kv:n, kt:kt+nho-1)
+    //     (the T region, columns > nw), both disjoint from V.
+    //  4. extra shifts, when the AED provides too few (laqr0_toofew_kernel, or the host in
+    //     hybrid mode; after step 3, which updates the rows of the trailing submatrix
+    //     above the window; V is dead): H(n-ns+1:n, 1:ns), as in LAPACK.
+    //  5. sweep chunks (after steps 3 and 4):
+    //     U  = H(n-kdu+1:n, 1:kdu), kdu = 3ns-3 (written by each chunk kernel and read by
+    //     the GEMMs that follow it), WH = H(n-kdu+1:n, kdu+1:kdu+nho') and
+    //     WV = H(kdu+4:n-kdu, 1:kdu), both disjoint from U.
+    // The shifts and eigenvalues are in W (not in H); the status arrays are separate.
+    for(I it = 1; it <= itmax; it++)
+    {
+        // done when kbot falls below ilo
+        if(kbot < ilo)
+            return 0;
+
+        // active block, deflation window, AED and shifts
+        if(!hybrid)
+        {
+            ROCSOLVER_LAUNCH_KERNEL((laqr0_iteration_kernel<HSEQR_BLOCKSIZE, T>), dim3(1),
+                                    dim3(HSEQR_BLOCKSIZE), 0, stream, n, ilo, kbot, ndfl, nw, ndec,
+                                    nwr_t, nwmax, nsr_t, nsmax, H, ldh, W, dstatus, dstatusT);
+        }
+        else
+        {
+            ROCSOLVER_LAUNCH_KERNEL((laqr0_part1_kernel<HSEQR_BLOCKSIZE, T>), dim3(1),
+                                    dim3(HSEQR_BLOCKSIZE), 0, stream, n, ilo, kbot, ndfl, nw, ndec,
+                                    nwr_t, nwmax, H, ldh, W, dstatus, dstatusT);
+            HIP_CHECK(hipMemcpyAsync(st, dstatus, sizeof(I) * LAQR0_STATUS_SIZE,
+                                     hipMemcpyDeviceToHost, stream));
+            HIP_CHECK(hipMemcpyAsync(stT, dstatusT, sizeof(T) * LAQR0_STATUS_SCALAR_SIZE,
+                                     hipMemcpyDeviceToHost, stream));
+            HIP_CHECK(hipStreamSynchronize(stream));
+
+            if(st[LAQR0_CORE])
+            {
+                // core of the aggressive early deflation on the host, with the window
+                // T = H(kv,kt) (and V = I) copied from the device
+                const I nwc = st[LAQR0_NW];
+                const I jw = st[LAQR0_JW];
+                const I kwtop = st[LAQR0_KWTOP];
+                const I kv = n - nwc + 1;
+                const I kt = nwc + 1;
+                hT.resize(size_t(jw) * jw);
+                hV.assign(size_t(jw) * jw, T(0));
+                hWsh.resize(jw);
+                hwork.resize(jw);
+                for(I i = 0; i < jw; i++)
+                    hV[i + size_t(i) * jw] = T(1);
+                HIP_CHECK(hipMemcpy2DAsync(hT.data(), sizeof(T) * jw, h(kv, kt), sizeof(T) * ldh,
+                                           sizeof(T) * jw, jw, hipMemcpyDeviceToHost, stream));
+                HIP_CHECK(hipStreamSynchronize(stream));
+
+                I s_ired[2][1];
+                S s_sred[2][1];
+                int ibuf = 0, sbuf = 0;
+                I ns, nd;
+                bool update;
+                T spike;
+                aed_core_block<1>(n, jw, stT[LAQR0_SPIKE_IN], hT.data(), jw, hV.data(), jw,
+                                  hwork.data(), hWsh.data(), ns, nd, update, spike, s_ired, s_sred,
+                                  ibuf, sbuf);
+                st[LAQR0_LS] = ns;
+                st[LAQR0_LD] = nd;
+                st[LAQR0_UPDATE] = update ? 1 : 0;
+                stT[LAQR0_SPIKE_OUT] = spike;
+
+                HIP_CHECK(hipMemcpy2DAsync(h(kv, kt), sizeof(T) * ldh, hT.data(), sizeof(T) * jw,
+                                           sizeof(T) * jw, jw, hipMemcpyHostToDevice, stream));
+                HIP_CHECK(hipMemcpy2DAsync(h(kv, 1), sizeof(T) * ldh, hV.data(), sizeof(T) * jw,
+                                           sizeof(T) * jw, jw, hipMemcpyHostToDevice, stream));
+                HIP_CHECK(hipMemcpyAsync(W + (kwtop - 1), hWsh.data(), sizeof(T) * jw,
+                                         hipMemcpyHostToDevice, stream));
+                HIP_CHECK(hipMemcpyAsync(dstatus, st, sizeof(I) * LAQR0_STATUS_SIZE,
+                                         hipMemcpyHostToDevice, stream));
+                HIP_CHECK(hipMemcpyAsync(dstatusT, stT, sizeof(T) * LAQR0_STATUS_SCALAR_SIZE,
+                                         hipMemcpyHostToDevice, stream));
+            }
+
+            ROCSOLVER_LAUNCH_KERNEL((laqr0_part2_kernel<HSEQR_BLOCKSIZE, T>), dim3(1),
+                                    dim3(HSEQR_BLOCKSIZE), 0, stream, n, kbot, ndfl, nwmax, nsr_t,
+                                    nsmax, H, ldh, W, dstatus, dstatusT);
+        }
+        HIP_CHECK(hipMemcpyAsync(st, dstatus, sizeof(I) * LAQR0_STATUS_SIZE, hipMemcpyDeviceToHost,
+                                 stream));
+        HIP_CHECK(hipStreamSynchronize(stream));
+
+        const I ktop = st[LAQR0_KTOP];
+        nw = st[LAQR0_NW];
+        ndec = st[LAQR0_NDEC];
+        const I ld = st[LAQR0_LD];
+
+        // off-window updates of the AED (ZLAQR2), through the workspace below the
+        // subdiagonal: V = H(kv,1), T = H(kv,kt) (nw-by-nho), WV = H(kwv,1) (nve-by-nw)
+        if(st[LAQR0_UPDATE])
+        {
+            const I jw = st[LAQR0_JW];
+            const I kwtop = st[LAQR0_KWTOP];
+            const I kv = n - nw + 1;
+            const I kt = nw + 1;
+            const I nho = (n - nw - 1) - kt + 1;
+            const I kwv = nw + 2;
+            const I nve = (n - nw) - kwv + 1;
+            T* V = h(kv, 1);
+
+            const I ltop = wantt ? I(1) : ktop;
+            for(I krow = ltop; krow <= kwtop - 1; krow += nve)
+            {
+                const I kln = std::min(nve, kwtop - krow);
+                gemm_copy(rocblas_operation_none, kln, jw, jw, h(krow, kwtop), ldh, V, ldh,
+                          h(krow, kwtop), ldh, h(kwv, 1), ldh);
+            }
+            if(wantt)
+            {
+                for(I kcol = kbot + 1; kcol <= n; kcol += nho)
+                {
+                    const I kln = std::min(nho, n - kcol + 1);
+                    gemm_copy(rocblas_operation_conjugate_transpose, jw, kln, jw, V, ldh,
+                              h(kwtop, kcol), ldh, h(kwtop, kcol), ldh, h(kv, kt), ldh);
+                }
+            }
+            if(wantz)
+            {
+                for(I krow = iloz; krow <= ihiz; krow += nve)
+                {
+                    const I kln = std::min(nve, ihiz - krow + 1);
+                    gemm_copy(rocblas_operation_none, kln, jw, jw, z(krow, kwtop), ldz, V, ldh,
+                              z(krow, kwtop), ldz, h(kwv, 1), ldh);
+                }
+            }
+        }
+
+        // too few shifts from the AED: they are the eigenvalues of the trailing submatrix
+        // H(ks:kbot2, ks:kbot2) (ZLAHQR), computed now that the off-window updates of the
+        // AED have updated its rows above the window
+        if(st[LAQR0_TOOFEW])
+        {
+            if(hybrid)
+            {
+                // on the host, as in laqr0_toofew_block
+                const I nsb = st[LAQR0_NS];
+                const I ksb = st[LAQR0_KS];
+                const I kbot2 = st[LAQR0_KBOT];
+                hB.resize(size_t(nsb) * nsb);
+                hWs.resize(nsb);
+                HIP_CHECK(hipMemcpy2DAsync(hB.data(), sizeof(T) * nsb, h(ksb, ksb), sizeof(T) * ldh,
+                                           sizeof(T) * nsb, nsb, hipMemcpyDeviceToHost, stream));
+                HIP_CHECK(hipStreamSynchronize(stream));
+
+                auto b = [&](const I i, const I j) -> T { return hB[(i - 1) + size_t(j - 1) * nsb]; };
+                const T hb[4] = {b(nsb - 1, nsb - 1), b(nsb, nsb - 1), b(nsb - 1, nsb), b(nsb, nsb)};
+                I s_ired[2][1];
+                int ibuf = 0;
+                const I inf = lahqr_block<1>(false, false, nsb, I(1), nsb, hB.data(), nsb,
+                                             hWs.data(), I(1), I(1), (T*)nullptr, I(1), s_ired, ibuf);
+                I ns = nsb;
+                I ks = ksb + inf;
+                laqr0_shifts_tail<1>(true, ks >= kbot2, ns, ks, kbot2, hWs.data(), ksb, hb);
+                if(ns > 0)
+                    HIP_CHECK(hipMemcpyAsync(W + (ks - 1), hWs.data() + (ks - ksb), sizeof(T) * ns,
+                                             hipMemcpyHostToDevice, stream));
+                st[LAQR0_NS] = ns;
+                st[LAQR0_KS] = ks;
+                st[LAQR0_TOOFEW] = 0;
+            }
+            else
+            {
+                ROCSOLVER_LAUNCH_KERNEL((laqr0_toofew_kernel<HSEQR_BLOCKSIZE, T>), dim3(1),
+                                        dim3(HSEQR_BLOCKSIZE), 0, stream, n, H, ldh, W, dstatus);
+                HIP_CHECK(hipMemcpyAsync(st, dstatus, sizeof(I) * LAQR0_STATUS_SIZE,
+                                         hipMemcpyDeviceToHost, stream));
+                HIP_CHECK(hipStreamSynchronize(stream));
+            }
+        }
+
+        kbot = st[LAQR0_KBOT];
+
+        // small-bulge multishift QR sweep (ZLAQR5, LAPACK 3.9.0) with the workspace
+        // below the subdiagonal: U = H(ku,1) (kdu-by-kdu), WH = H(ku,kwh) (kdu-by-nho),
+        // WV = H(kwv,1) (nve-by-kdu)
+        const I ns = st[LAQR0_NS];
+        if(st[LAQR0_SWEEP] && ns >= 2 && ktop < kbot)
+        {
+            const I ks = st[LAQR0_KS];
+            const I nbmps = ns / 2;
+            const I kdu = 3 * ns - 3;
+            const I ku = n - kdu + 1;
+            const I kwh = kdu + 1;
+            const I nho = (n - kdu + 1 - 4) - (kdu + 1) + 1;
+            const I kwv = kdu + 4;
+            const I nve = n - kdu - kwv + 1;
+            T* U = h(ku, 1);
+
+            // clear trash
+            if(ktop + 2 <= kbot)
+                HIP_CHECK(hipMemsetAsync(h(ktop + 2, ktop), 0, sizeof(T), stream));
+
+            for(I incol = 3 * (1 - nbmps) + ktop - 1; incol <= kbot - 2; incol += 3 * nbmps - 2)
+            {
+                ROCSOLVER_LAUNCH_KERNEL((laqr5_chunk_kernel<HSEQR_CHASE_BLOCKSIZE, T>), dim3(1),
+                                        dim3(HSEQR_CHASE_BLOCKSIZE), 0, stream, wantt, wantz, accum,
+                                        n, ktop, kbot, nbmps, incol, W + (ks - 1), H, ldh, iloz,
+                                        ihiz, Z, ldz, U, ldh);
+
+                if(accum)
+                {
+                    // use U to update far-from-diagonal entries in H and, if required, Z
+                    const I jtop = wantt ? I(1) : ktop;
+                    const I jbot = wantt ? n : kbot;
+                    const I ndcol = incol + kdu;
+                    const I k1 = std::max(I(1), ktop - incol);
+                    const I nu = (kdu - std::max(I(0), ndcol - kbot)) - k1 + 1;
+                    T* Uk = U + idx2D(k1 - 1, k1 - 1, ldh);
+
+                    for(I jcol = std::min(ndcol, kbot) + 1; jcol <= jbot; jcol += nho)
+                    {
+                        const I jlen = std::min(nho, jbot - jcol + 1);
+                        gemm_copy(rocblas_operation_conjugate_transpose, nu, jlen, nu, Uk, ldh,
+                                  h(incol + k1, jcol), ldh, h(incol + k1, jcol), ldh, h(ku, kwh),
+                                  ldh);
+                    }
+                    for(I jrow = jtop; jrow <= std::max(ktop, incol) - 1; jrow += nve)
+                    {
+                        const I jlen = std::min(nve, std::max(ktop, incol) - jrow);
+                        gemm_copy(rocblas_operation_none, jlen, nu, nu, h(jrow, incol + k1), ldh,
+                                  Uk, ldh, h(jrow, incol + k1), ldh, h(kwv, 1), ldh);
+                    }
+                    if(wantz)
+                    {
+                        for(I jrow = iloz; jrow <= ihiz; jrow += nve)
+                        {
+                            const I jlen = std::min(nve, ihiz - jrow + 1);
+                            gemm_copy(rocblas_operation_none, jlen, nu, nu, z(jrow, incol + k1),
+                                      ldz, Uk, ldh, z(jrow, incol + k1), ldz, h(kwv, 1), ldh);
+                        }
+                    }
+                }
+            }
+        }
+
+        // note progress (or the lack of it)
+        ndfl = (ld > 0) ? 1 : ndfl + 1;
+    }
+
+    // iteration limit exceeded
+    return kbot;
+}
+
+template <typename T, typename I>
+void rocsolver_hseqr_getMemorySize(const I n, const I batch_count, size_t* size_work, size_t* size_workT)
+{
+    // status arrays of the multishift path
+    if(n <= HSEQR_NMIN || batch_count == 0)
+    {
+        *size_work = 0;
+        *size_workT = 0;
+    }
+    else
+    {
+        // (and the flags of the matrices with NaN or infinite entries)
+        *size_work = sizeof(I) * (LAQR0_STATUS_SIZE + batch_count);
+        *size_workT = sizeof(T) * LAQR0_STATUS_SCALAR_SIZE;
+    }
+}
+
+template <typename T, typename I, typename U>
+rocblas_status rocsolver_hseqr_argCheck(rocblas_handle handle,
+                                        const rocsolver_schur_job job,
+                                        const rocsolver_schur_vectors compz,
+                                        const I n,
+                                        const I* ilo,
+                                        const I* ihi,
+                                        const I ldh,
+                                        const I ldz,
+                                        U H,
+                                        T* W,
+                                        U Z,
+                                        I* info,
+                                        const I batch_count = 1)
+{
+    // order is important for unit tests:
+
+    // 1. invalid/non-supported values
+    if(job != rocsolver_schur_eigenvalues && job != rocsolver_schur_form)
+        return rocblas_status_invalid_value;
+    if(compz != rocsolver_schur_vectors_none && compz != rocsolver_schur_vectors_initialize
+       && compz != rocsolver_schur_vectors_update)
+        return rocblas_status_invalid_value;
+    const bool wantz = (compz != rocsolver_schur_vectors_none);
+
+    // 2. invalid size
+    if(n < 0 || ldh < n || ldh < 1 || ldz < 1 || (wantz && ldz < n) || batch_count < 0)
+        return rocblas_status_invalid_size;
+
+    // skip pointer check if querying memory size
+    if(rocblas_is_device_memory_size_query(handle))
+        return rocblas_status_continue;
+
+    // 3. invalid pointers
+    if((n && !H) || (n && !W) || (n && wantz && !Z) || (n && batch_count && !ilo)
+       || (n && batch_count && !ihi) || (batch_count && !info))
+        return rocblas_status_invalid_pointer;
+
+    return rocblas_status_continue;
+}
+
+template <bool BATCHED, bool STRIDED, typename T, typename I, typename U>
+rocblas_status rocsolver_hseqr_template(rocblas_handle handle,
+                                        const rocsolver_schur_job job,
+                                        const rocsolver_schur_vectors compz,
+                                        const I n,
+                                        const I* ilo,
+                                        const I* ihi,
+                                        U H,
+                                        const rocblas_stride shiftH,
+                                        const I ldh,
+                                        const rocblas_stride strideH,
+                                        T* W,
+                                        const rocblas_stride strideW,
+                                        U Z,
+                                        const rocblas_stride shiftZ,
+                                        const I ldz,
+                                        const rocblas_stride strideZ,
+                                        I* info,
+                                        const I batch_count,
+                                        I* work,
+                                        T* workT)
+{
+    ROCSOLVER_ENTER("hseqr", "job:", job, "compz:", compz, "n:", n, "shiftH:", shiftH, "ldh:", ldh,
+                    "shiftZ:", shiftZ, "ldz:", ldz, "bc:", batch_count);
+
+    // quick return
+    if(batch_count == 0)
+        return rocblas_status_success;
+
+    hipStream_t stream;
+    rocblas_get_stream(handle, &stream);
+
+    // small matrices: single-shift QR (ZLAHQR), all the matrices of the batch in parallel
+    // (when n == 0 the kernel only sets info = 0)
+    if(n <= HSEQR_NMIN)
+    {
+        ROCSOLVER_LAUNCH_KERNEL((hseqr_kernel<HSEQR_BLOCKSIZE, T>), dim3(batch_count),
+                                dim3(HSEQR_BLOCKSIZE), 0, stream, job, compz, n, ilo, ihi, H,
+                                shiftH, ldh, strideH, W, strideW, Z, shiftZ, ldz, strideZ, info);
+        return rocblas_status_success;
+    }
+
+    // larger matrices: multishift QR with aggressive early deflation (ZLAQR0), one matrix
+    // of the batch at a time (the control flow depends on the data)
+    const bool wantt = (job == rocsolver_schur_form);
+    const bool wantz = (compz != rocsolver_schur_vectors_none);
+
+    // the core of the aggressive early deflation runs on the host in hybrid mode
+    rocsolver_alg_mode alg_mode;
+    ROCBLAS_CHECK(rocsolver_get_alg_mode(handle, rocsolver_function_hseqr, &alg_mode));
+    const bool hybrid = (alg_mode == rocsolver_alg_mode_hybrid);
+
+    const I blocks = (n - 1) / BS1 + 1;
+    ROCSOLVER_LAUNCH_KERNEL((hseqr_prepare_kernel<T>), dim3(blocks, batch_count), dim3(BS1), 0,
+                            stream, compz, n, ilo, ihi, H, shiftH, ldh, strideH, W, strideW, Z,
+                            shiftZ, ldz, strideZ);
+
+    // diagonal blocks with a NaN or an infinite entry (and those above them) are not
+    // iterated on
+    I* dflag = work + LAQR0_STATUS_SIZE;
+    ROCSOLVER_LAUNCH_KERNEL((hseqr_check_kernel<HSEQR_BLOCKSIZE, T>), dim3(batch_count),
+                            dim3(HSEQR_BLOCKSIZE), 0, stream, n, ilo, ihi, H, shiftH, ldh, strideH,
+                            W, strideW, dflag);
+
+    std::vector<I> hilo(batch_count), hihi(batch_count), hflag(batch_count);
+    std::vector<T*> hH(batch_count), hZ(batch_count, nullptr);
+    HIP_CHECK(hipMemcpyAsync(hflag.data(), dflag, sizeof(I) * batch_count, hipMemcpyDeviceToHost,
+                             stream));
+    HIP_CHECK(
+        hipMemcpyAsync(hilo.data(), ilo, sizeof(I) * batch_count, hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(
+        hipMemcpyAsync(hihi.data(), ihi, sizeof(I) * batch_count, hipMemcpyDeviceToHost, stream));
+    if constexpr(BATCHED)
+    {
+        HIP_CHECK(
+            hipMemcpyAsync(hH.data(), H, sizeof(T*) * batch_count, hipMemcpyDeviceToHost, stream));
+        if(wantz)
+            HIP_CHECK(hipMemcpyAsync(hZ.data(), Z, sizeof(T*) * batch_count, hipMemcpyDeviceToHost,
+                                     stream));
+    }
+    HIP_CHECK(hipStreamSynchronize(stream));
+
+    for(I b = 0; b < batch_count; b++)
+    {
+        T* Hb;
+        T* Zb = nullptr;
+        if constexpr(BATCHED)
+        {
+            Hb = hH[b] + shiftH;
+            if(wantz)
+                Zb = hZ[b] + shiftZ;
+        }
+        else
+        {
+            Hb = H + shiftH + b * strideH;
+            if(wantz)
+                Zb = Z + shiftZ + b * strideZ;
+        }
+        T* Wb = W + b * strideW;
+
+        // (ilo and ihi are clamped to a valid range, as in the small-size kernel)
+        const I ilob = std::min(std::max(hilo[b], I(1)), n);
+        const I ihib = std::min(std::max(hihi[b], ilob), n);
+
+        // with a NaN or an infinite entry in a diagonal block of size > 1, only the
+        // rows below the lowest such block (ibad = hflag[b]) are iterated on, and info = ibad
+        // if they converge (see hseqr_check_kernel; the Z rows are still ilo:ihi)
+        const I ibad = hflag[b];
+        const I ilo1 = ibad > 0 ? ibad + 1 : ilob;
+        I infob = 0;
+        if(ilo1 < ihib)
+            infob = hseqr_multishift<T>(handle, wantt, wantz, n, ilo1, ihib, Hb, ldh, Wb, ilob,
+                                        ihib, Zb, ldz, work, workT, hybrid);
+        if(infob == 0)
+            infob = ibad;
+
+        // clear out the trash, if necessary (not when ilo == ihi, as in LAPACK)
+        const bool clean = (wantt || infob != 0) && ilob < ihib;
+        ROCSOLVER_LAUNCH_KERNEL((hseqr_finish_kernel<T>), dim3(blocks), dim3(BS1), 0, stream, clean,
+                                n, Hb, ldh, info + b, infob);
+    }
+
+    return rocblas_status_success;
+}
+
+ROCSOLVER_END_NAMESPACE

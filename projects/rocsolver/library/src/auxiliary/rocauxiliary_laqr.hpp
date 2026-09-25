@@ -1,0 +1,1371 @@
+/************************************************************************
+ * Derived from the BSD3-licensed
+ * LAPACK routine (version 3.12.0) --
+ *     Univ. of Tennessee, Univ. of California Berkeley,
+ *     Univ. of Colorado Denver and NAG Ltd..
+ *     November 2023
+ * Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ * *************************************************************************/
+
+#pragma once
+
+#include "lapack/roclapack_trexc.hpp"
+#include "rocauxiliary_lahqr.hpp"
+#include "rocblas.hpp"
+#include "rocsolver/rocsolver.h"
+
+ROCSOLVER_BEGIN_NAMESPACE
+
+/*
+ * ===========================================================================
+ *    Device building blocks of the multishift QR algorithm with aggressive
+ *    early deflation (LAPACK ZLAQR0, ZLAQR2 and ZLAQR5). All the routines are
+ *    executed by a whole thread-block; indices are 1-based, as in LAPACK.
+ * ===========================================================================
+ */
+
+/** HQR_BLOCK_SUM returns the sum of v over the thread-block to all the threads
+    (in the same order in all of them). s_red is a shared buffer of 2 x BS/32 entries,
+    used alternately (selected by buf), so that one barrier per call is enough. **/
+template <int BS, typename S>
+__host__ __device__ S hqr_block_sum(S v, S (*s_red)[HQR_RED(BS)], int& buf)
+{
+#if defined(__HIP_DEVICE_COMPILE__)
+    const int lane = hqr_tid() % warpSize;
+    const int wave = hqr_tid() / warpSize;
+    const int nwaves = BS / warpSize;
+
+    for(int offset = warpSize / 2; offset > 0; offset /= 2)
+        v += __shfl_xor(v, offset);
+    if(lane == 0)
+        s_red[buf][wave] = v;
+    hqr_sync();
+    v = s_red[buf][0];
+    for(int w = 1; w < nwaves; w++)
+        v += s_red[buf][w];
+    buf = 1 - buf;
+    return v;
+#else
+    return v;
+#endif
+}
+
+/** HQR_BLOCK_MAXS returns the maximum of v (a non-negative real value) over the
+    thread-block to all the threads, with the same buffering scheme as hqr_block_sum. **/
+template <int BS, typename S>
+__host__ __device__ S hqr_block_maxs(S v, S (*s_red)[HQR_RED(BS)], int& buf)
+{
+#if defined(__HIP_DEVICE_COMPILE__)
+    const int lane = hqr_tid() % warpSize;
+    const int wave = hqr_tid() / warpSize;
+    const int nwaves = BS / warpSize;
+
+    for(int offset = warpSize / 2; offset > 0; offset /= 2)
+        v = std::max(v, S(__shfl_xor(v, offset)));
+    if(lane == 0)
+        s_red[buf][wave] = v;
+    hqr_sync();
+    v = s_red[buf][0];
+    for(int w = 1; w < nwaves; w++)
+        v = std::max(v, s_red[buf][w]);
+    buf = 1 - buf;
+    return v;
+#else
+    return v;
+#endif
+}
+
+/** HQR_BLOCK_NRM2 returns the 2-norm of the vector x of length m (stride 1) to all
+    the threads. The entries are scaled by a power of two close to the largest one,
+    so that the sum of squares cannot overflow or underflow. **/
+template <int BS, typename T, typename I, typename S>
+__host__ __device__ S hqr_block_nrm2(const I m, const T* x, S (*s_red)[HQR_RED(BS)], int& buf)
+{
+    const I tid = hqr_tid();
+    S amax = 0;
+    for(I j = tid; j < m; j += BS)
+        amax = std::max(amax, std::max(std::abs(x[j].real()), std::abs(x[j].imag())));
+    amax = hqr_block_maxs<BS>(amax, s_red, buf);
+    if(amax == 0 || !std::isfinite(amax))
+        return amax;
+
+    int e;
+    frexp(amax, &e);
+    S ssq = 0;
+    for(I j = tid; j < m; j += BS)
+    {
+        S re = ldexp(x[j].real(), -e);
+        S im = ldexp(x[j].imag(), -e);
+        ssq += re * re + im * im;
+    }
+    ssq = hqr_block_sum<BS>(ssq, s_red, buf);
+    return ldexp(std::sqrt(ssq), e);
+}
+
+/** HQR_BLOCK_LARFG generates an elementary reflector H of order m such that
+    H^H * [alpha; x] = [beta; 0], with beta real (LAPACK ZLARFG with incx = 1).
+    alpha is read from and written to *alpha (beta on exit), and x (m-1 entries,
+    stride 1) is overwritten with the tail of the Householder vector. tau is returned
+    to all the threads. **/
+template <int BS, typename T, typename I, typename S>
+__host__ __device__ T hqr_block_larfg(const I m, T* alpha, T* x, S (*s_red)[HQR_RED(BS)], int& buf)
+{
+    const I tid = hqr_tid();
+
+    if(m <= 0)
+        return T(0);
+
+    S xnorm = hqr_block_nrm2<BS>(m - 1, x, s_red, buf);
+    T a = *alpha;
+    S alphr = a.real();
+    S alphi = a.imag();
+
+    if(xnorm == 0 && alphi == 0)
+    {
+        // H = I (all the threads have read alpha before the caller changes it)
+        hqr_sync();
+        return T(0);
+    }
+
+    // general case
+    S beta = -std::copysign(hqr_lapy3(alphr, alphi, xnorm), alphr);
+    const S safmin = hqr_safmin<S>() / hqr_eps<S>();
+    const S rsafmn = S(1) / safmin;
+
+    int knt = 0;
+    if(std::abs(beta) < safmin)
+    {
+        // xnorm, beta may be inaccurate; scale x and recompute them
+        do
+        {
+            knt++;
+            hqr_sync();
+            for(I j = tid; j < m - 1; j += BS)
+                x[j] = rsafmn * x[j];
+            beta = beta * rsafmn;
+            alphi = alphi * rsafmn;
+            alphr = alphr * rsafmn;
+        } while(std::abs(beta) < safmin && knt < 20);
+        hqr_sync();
+
+        // new beta is at most 1, at least safmin
+        xnorm = hqr_block_nrm2<BS>(m - 1, x, s_red, buf);
+        a = T(alphr, alphi);
+        beta = -std::copysign(hqr_lapy3(alphr, alphi, xnorm), alphr);
+    }
+    T tau = T((beta - alphr) / beta, -alphi / beta);
+    T scal = hqr_zladiv(T(1), a - beta);
+    for(I j = tid; j < m - 1; j += BS)
+        x[j] = scal * x[j];
+
+    // if alpha is subnormal, it may lose relative accuracy
+    for(int j = 0; j < knt; j++)
+        beta = beta * safmin;
+
+    // all the threads have read *alpha
+    hqr_sync();
+    if(tid == 0)
+        *alpha = T(beta);
+    hqr_sync();
+    return tau;
+}
+
+/** HQR_BLOCK_LARF_LEFT applies H = I - tau * v * v^H from the left to the m-by-n
+    matrix C: C <- H * C. v has m entries (stride 1). Each thread processes whole columns. **/
+template <int BS, typename T, typename I>
+__host__ __device__ void
+    hqr_block_larf_left(const I m, const I n, const T* v, const T tau, T* C, const I ldc)
+{
+    const I tid = hqr_tid();
+    if(tau == T(0))
+        return;
+    for(I j = tid; j < n; j += BS)
+    {
+        T w = 0;
+        for(I i = 0; i < m; i++)
+            w += conj(v[i]) * C[idx2D(i, j, ldc)];
+        w = tau * w;
+        for(I i = 0; i < m; i++)
+            C[idx2D(i, j, ldc)] -= v[i] * w;
+    }
+}
+
+/** HQR_BLOCK_LARF_RIGHT applies H = I - tau * v * v^H from the right to the m-by-n
+    matrix C: C <- C * H. v has n entries (stride 1). Each thread processes whole rows. **/
+template <int BS, typename T, typename I>
+__host__ __device__ void
+    hqr_block_larf_right(const I m, const I n, const T* v, const T tau, T* C, const I ldc)
+{
+    const I tid = hqr_tid();
+    if(tau == T(0))
+        return;
+    for(I i = tid; i < m; i += BS)
+    {
+        T w = 0;
+        for(I j = 0; j < n; j++)
+            w += C[idx2D(i, j, ldc)] * v[j];
+        w = tau * w;
+        for(I j = 0; j < n; j++)
+            C[idx2D(i, j, ldc)] -= w * conj(v[j]);
+    }
+}
+
+/*
+ * ===========================================================================
+ *    Aggressive early deflation (LAPACK ZLAQR2), in three parts:
+ *    - aed_setup_block (device): selects the window and copies it to T (V = I),
+ *    - aed_core_block (device, or host with BS = 1): Schur form of the window,
+ *      deflation tests, reordering, and return to Hessenberg form,
+ *    - aed_finish_block (device): copies the window back into H.
+ *    The off-window updates (H(ltop:kwtop-1, kwtop:kbot) <- H * V, H(kwtop:kbot,
+ *    kbot+1:n) <- V^H * H if wantt, and Z(iloz:ihiz, kwtop:kbot) <- Z * V if wantz)
+ *    are left to the caller, when update is true.
+ * ===========================================================================
+ */
+
+/** AED_SETUP_BLOCK selects the deflation window (jw, kwtop) and the spike s. If
+    the window is empty or 1-by-1, it completes the deflation (ns, nd) and returns
+    false. Otherwise, it copies the upper Hessenberg part of the window to T (zero
+    below), sets V = I, and returns true. **/
+template <int BS, typename T, typename I>
+__device__ bool aed_setup_block(const I n,
+                                const I ktop,
+                                const I kbot,
+                                const I nw,
+                                T* H,
+                                const I ldh,
+                                T* W,
+                                T* Tw,
+                                const I ldt,
+                                T* V,
+                                const I ldv,
+                                I& jw,
+                                I& kwtop,
+                                T& s,
+                                I& ns,
+                                I& nd)
+{
+    using S = decltype(std::real(T{}));
+
+    const I tid = hqr_tid();
+    auto h = [&](const I i, const I j) -> T& { return H[idx2D(i - 1, j - 1, ldh)]; };
+    auto t = [&](const I i, const I j) -> T& { return Tw[idx2D(i - 1, j - 1, ldt)]; };
+    auto v = [&](const I i, const I j) -> T& { return V[idx2D(i - 1, j - 1, ldv)]; };
+
+    const S safmin = hqr_safmin<S>();
+    const S ulp = hqr_ulp<S>();
+    const S smlnum = safmin * (S(n) / ulp);
+
+    // nothing to do for an empty active block or window
+    if(ktop > kbot || nw < 1)
+    {
+        jw = 0;
+        kwtop = kbot + 1;
+        s = T(0);
+        ns = 0;
+        nd = 0;
+        return false;
+    }
+
+    // setup deflation window
+    jw = std::min(nw, kbot - ktop + 1);
+    kwtop = kbot - jw + 1;
+    s = (kwtop == ktop) ? T(0) : h(kwtop, kwtop - 1);
+
+    if(kbot == kwtop)
+    {
+        // 1-by-1 deflation window: not much to do
+        ns = 1;
+        nd = 0;
+        T hkk = h(kwtop, kwtop);
+        if(hqr_cabs1(s) <= std::max(smlnum, ulp * hqr_cabs1(hkk)))
+        {
+            ns = 0;
+            nd = 1;
+        }
+        __syncthreads();
+        if(tid == 0)
+        {
+            W[kwtop - 1] = hkk;
+            if(ns == 0 && kwtop > ktop)
+                h(kwtop, kwtop - 1) = T(0);
+        }
+        __syncthreads();
+        return false;
+    }
+
+    // convert to spike-triangular form: T = window (upper Hessenberg part), V = I
+    for(I j = 1; j <= jw; j++)
+        for(I i = 1 + tid; i <= jw; i += BS)
+        {
+            t(i, j) = (i <= j + 1) ? h(kwtop + i - 1, kwtop + j - 1) : T(0);
+            v(i, j) = (i == j) ? T(1) : T(0);
+        }
+    __syncthreads();
+    return true;
+}
+
+/** AED_CORE_BLOCK performs the part of ZLAQR2 that only involves the jw-by-jw
+    window (jw > 1): given the spike s, T (the window in upper Hessenberg form, zero
+    below) and V = I, it computes the Schur form of T (ZLAHQR), tests the spike for
+    deflation from the bottom (moving undeflatable eigenvalues up with TREXC),
+    sorts the undeflated eigenvalues, and, if needed, reflects the spike back and
+    returns T to Hessenberg form (ZGEHRD + ZUNMHR). The eigenvalues are returned in
+    Wsh (jw entries), work has at least jw entries, and on exit:
+    - ns: number of undeflated eigenvalues (the shifts),
+    - nd: number of deflated eigenvalues,
+    - update: whether H must be updated with T and V,
+    - spike: the new value of H(kwtop, kwtop-1).
+    On the device it is executed by all the threads of a thread-block of BS threads;
+    on the host, with BS = 1. **/
+template <int BS, typename T, typename I>
+__host__ __device__ void aed_core_block(const I n,
+                                        const I jw,
+                                        T s,
+                                        T* Tw,
+                                        const I ldt,
+                                        T* V,
+                                        const I ldv,
+                                        T* work,
+                                        T* Wsh,
+                                        I& ns_out,
+                                        I& nd_out,
+                                        bool& update,
+                                        T& spike,
+                                        I (*s_ired)[HQR_RED(BS)],
+                                        decltype(std::real(T{})) (*s_sred)[HQR_RED(BS)],
+                                        int& ibuf,
+                                        int& sbuf)
+{
+    using S = decltype(std::real(T{}));
+
+    const I tid = hqr_tid();
+    auto t = [&](const I i, const I j) -> T& { return Tw[idx2D(i - 1, j - 1, ldt)]; };
+    auto v = [&](const I i, const I j) -> T& { return V[idx2D(i - 1, j - 1, ldv)]; };
+
+    const S safmin = hqr_safmin<S>();
+    const S ulp = hqr_ulp<S>();
+    const S smlnum = safmin * (S(n) / ulp);
+
+    const I infqr
+        = lahqr_block<BS>(true, true, jw, I(1), jw, Tw, ldt, Wsh, I(1), jw, V, ldv, s_ired, ibuf);
+    hqr_sync();
+
+    // deflation detection loop
+    I ns = jw;
+    I ilst = infqr + 1;
+    for(I knt = infqr + 1; knt <= jw; knt++)
+    {
+        // small spike tip deflation test
+        S foo = hqr_cabs1(t(ns, ns));
+        if(foo == 0)
+            foo = hqr_cabs1(s);
+        if(hqr_cabs1(s) * hqr_cabs1(v(1, ns)) <= std::max(smlnum, ulp * foo))
+        {
+            // one more converged eigenvalue
+            ns = ns - 1;
+        }
+        else
+        {
+            // one undeflatable eigenvalue; move it up out of the way
+            hqr_sync();
+            trexc_block<BS>(true, jw, Tw, ldt, V, ldv, ns, ilst);
+            ilst = ilst + 1;
+        }
+    }
+
+    // return to Hessenberg form
+    if(ns == 0)
+        s = T(0);
+
+    if(ns < jw)
+    {
+        // sorting the diagonal of T improves accuracy for graded matrices
+        for(I i = infqr + 1; i <= ns; i++)
+        {
+            I ifst = i;
+            for(I j = i + 1; j <= ns; j++)
+                if(hqr_cabs1(t(j, j)) > hqr_cabs1(t(ifst, ifst)))
+                    ifst = j;
+            if(ifst != i)
+            {
+                hqr_sync();
+                trexc_block<BS>(true, jw, Tw, ldt, V, ldv, ifst, i);
+            }
+        }
+    }
+    hqr_sync();
+
+    // restore shift/eigenvalue array from T
+    for(I i = infqr + 1 + tid; i <= jw; i += BS)
+        Wsh[i - 1] = t(i, i);
+
+    update = (ns < jw || s == T(0));
+    if(update && ns > 1 && s != T(0))
+    {
+        // reflect spike back into lower triangle
+        for(I i = 1 + tid; i <= ns; i += BS)
+            work[i - 1] = conj(v(1, i));
+        hqr_sync();
+        T tau = hqr_block_larfg<BS>(ns, work, work + 1, s_sred, sbuf);
+        if(tid == 0)
+            work[0] = T(1);
+
+        // zero T below the first subdiagonal
+        for(I j = 1; j <= jw - 2; j++)
+            for(I i = j + 2 + tid; i <= jw; i += BS)
+                t(i, j) = T(0);
+        hqr_sync();
+
+        hqr_block_larf_left<BS>(ns, jw, work, conj(tau), Tw, ldt);
+        hqr_sync();
+        hqr_block_larf_right<BS>(ns, ns, work, tau, Tw, ldt);
+        hqr_block_larf_right<BS>(jw, ns, work, tau, V, ldv);
+        hqr_sync();
+
+        // Hessenberg reduction of T(1:ns, 1:ns) (ZGEHRD with ilo = 1 and ihi = ns),
+        // applying the reflectors also to V (ZUNMHR)
+        for(I i = 1; i <= ns - 1; i++)
+        {
+            // compute the elementary reflector H(i) to annihilate T(i+2:ns, i)
+            T taui = hqr_block_larfg<BS>(ns - i, &t(i + 1, i), &t(std::min(i + 2, jw), i), s_sred,
+                                         sbuf);
+            T alpha = t(i + 1, i);
+            hqr_sync();
+            if(tid == 0)
+                t(i + 1, i) = T(1);
+            hqr_sync();
+
+            // apply H(i) to T(1:ns, i+1:ns) from the right, to T(i+1:ns, i+1:jw) from the
+            // left, and to V(1:jw, i+1:ns) from the right
+            hqr_block_larf_right<BS>(ns, ns - i, &t(i + 1, i), taui, &t(1, i + 1), ldt);
+            hqr_sync();
+            hqr_block_larf_left<BS>(ns - i, jw - i, &t(i + 1, i), conj(taui), &t(i + 1, i + 1), ldt);
+            hqr_block_larf_right<BS>(jw, ns - i, &t(i + 1, i), taui, &v(1, i + 1), ldv);
+            hqr_sync();
+            if(tid == 0)
+                t(i + 1, i) = alpha;
+            hqr_sync();
+        }
+    }
+
+    spike = s * conj(v(1, 1));
+    ns_out = ns - infqr;
+    nd_out = jw - ns;
+    hqr_sync();
+}
+
+/** AED_FINISH_BLOCK copies the window T back into H(kwtop:kwtop+jw-1, ...) and sets
+    H(kwtop, kwtop-1) = spike, if update is true. **/
+template <int BS, typename T, typename I>
+__device__ void aed_finish_block(const I kwtop,
+                                 const I jw,
+                                 T* H,
+                                 const I ldh,
+                                 const T* Tw,
+                                 const I ldt,
+                                 const bool update,
+                                 const T spike)
+{
+    const I tid = hqr_tid();
+    if(update)
+    {
+        for(I j = 1; j <= jw; j++)
+            for(I i = 1 + tid; i <= std::min(j + 1, jw); i += BS)
+                H[idx2D(kwtop + i - 2, kwtop + j - 2, ldh)] = Tw[idx2D(i - 1, j - 1, ldt)];
+        __syncthreads();
+        if(tid == 0 && kwtop > 1)
+            H[idx2D(kwtop - 1, kwtop - 2, ldh)] = spike;
+    }
+    __syncthreads();
+}
+
+/** HQR_LAQR1 computes a scalar multiple of the first column of
+    (H - s1*I)*(H - s2*I) for the n-by-n (n = 2 or 3) leading block of H
+    (LAPACK ZLAQR1). Executed by a single thread. **/
+template <typename T, typename I>
+__device__ void hqr_laqr1(const int nn, const T* H, const I ldh, const T s1, const T s2, T* v)
+{
+    using S = decltype(std::real(T{}));
+    auto h = [&](const I i, const I j) -> T { return H[idx2D(i - 1, j - 1, ldh)]; };
+
+    if(nn == 2)
+    {
+        S s = hqr_cabs1(h(1, 1) - s2) + hqr_cabs1(h(2, 1));
+        if(s == 0)
+        {
+            v[0] = T(0);
+            v[1] = T(0);
+        }
+        else
+        {
+            T h21s = h(2, 1) / s;
+            v[0] = h21s * h(1, 2) + (h(1, 1) - s1) * ((h(1, 1) - s2) / s);
+            v[1] = h21s * (h(1, 1) + h(2, 2) - s1 - s2);
+        }
+    }
+    else
+    {
+        S s = hqr_cabs1(h(1, 1) - s2) + hqr_cabs1(h(2, 1)) + hqr_cabs1(h(3, 1));
+        if(s == 0)
+        {
+            v[0] = T(0);
+            v[1] = T(0);
+            v[2] = T(0);
+        }
+        else
+        {
+            T h21s = h(2, 1) / s;
+            T h31s = h(3, 1) / s;
+            v[0] = (h(1, 1) - s1) * ((h(1, 1) - s2) / s) + h(1, 2) * h21s + h(1, 3) * h31s;
+            v[1] = h21s * (h(1, 1) + h(2, 2) - s1 - s2) + h(2, 3) * h31s;
+            v[2] = h31s * (h(1, 1) + h(3, 3) - s1 - s2) + h21s * h(3, 2);
+        }
+    }
+}
+
+/*
+ * ===========================================================================
+ *    LAQR5_CHUNK_BLOCK: near-the-diagonal part of one chunk of a small-bulge
+ *    multishift QR sweep.
+ *
+ *    The sweep follows LAPACK 3.9.0 ZLAQR5, in which the 2-shift bulges are
+ *    spaced 3 rows apart (LAPACK 3.10 and later pack them 2 rows apart). With
+ *    this spacing, the reflections of different bulges act on disjoint rows and
+ *    columns, so that each step of the chase can be applied in parallel across
+ *    bulges (5 barriers per step, independently of the number of shifts), whereas
+ *    the tightly packed version requires the bulges to be processed one after the
+ *    other. The deflation checks and the handling of collapsed bulges are those of
+ *    LAPACK 3.9.0. Reflections are accumulated in U when accum is true (KACC22 = 1;
+ *    the 2-by-2 block structured update of KACC22 = 2 is not used), and the
+ *    far-from-diagonal updates are then left to the caller.
+ *
+ *    s contains the shifts (s[0:2*nbmps-1]), and sV is shared workspace for
+ *    nbmps+1 reflections.
+ * ===========================================================================
+ */
+template <int BS, typename T, typename I>
+__device__ void laqr5_chunk_block(const bool wantt,
+                                  const bool wantz,
+                                  const bool accum,
+                                  const I n,
+                                  const I ktop,
+                                  const I kbot,
+                                  const I nbmps,
+                                  const I incol,
+                                  const T* sh,
+                                  T* H,
+                                  const I ldh,
+                                  const I iloz,
+                                  const I ihiz,
+                                  T* Z,
+                                  const I ldz,
+                                  T* U,
+                                  const I ldu,
+                                  T (*sV)[3])
+{
+    using S = decltype(std::real(T{}));
+
+    const I tid = hipThreadIdx_x;
+    auto h = [&](const I i, const I j) -> T& { return H[idx2D(i - 1, j - 1, ldh)]; };
+    auto z = [&](const I i, const I j) -> T& { return Z[idx2D(i - 1, j - 1, ldz)]; };
+    auto u = [&](const I i, const I j) -> T& { return U[idx2D(i - 1, j - 1, ldu)]; };
+    auto vv = [&](const I r, const I m) -> T& { return sV[m][r - 1]; }; // V(r, m), 1-based
+    auto s = [&](const I i) -> T { return sh[i - 1]; }; // S(i), 1-based
+
+    const S safmin = hqr_safmin<S>();
+    const S ulp = hqr_ulp<S>();
+    const S smlnum = safmin * (S(n) / ulp);
+
+    const I kdu = 6 * nbmps - 3;
+    const I ndcol = incol + kdu;
+
+    if(accum)
+    {
+        for(I j = 1; j <= kdu; j++)
+            for(I i = 1 + tid; i <= kdu; i += BS)
+                u(i, j) = (i == j) ? T(1) : T(0);
+    }
+    __syncthreads();
+
+    // test for a negligible subdiagonal entry h(k+1,k) (Ahues & Tisseur)
+    auto vigilant = [&](const I k) {
+        if(h(k + 1, k) != T(0))
+        {
+            S tst1 = hqr_cabs1(h(k, k)) + hqr_cabs1(h(k + 1, k + 1));
+            if(tst1 == 0)
+            {
+                if(k >= ktop + 1)
+                    tst1 = tst1 + hqr_cabs1(h(k, k - 1));
+                if(k >= ktop + 2)
+                    tst1 = tst1 + hqr_cabs1(h(k, k - 2));
+                if(k >= ktop + 3)
+                    tst1 = tst1 + hqr_cabs1(h(k, k - 3));
+                if(k <= kbot - 2)
+                    tst1 = tst1 + hqr_cabs1(h(k + 2, k + 1));
+                if(k <= kbot - 3)
+                    tst1 = tst1 + hqr_cabs1(h(k + 3, k + 1));
+                if(k <= kbot - 4)
+                    tst1 = tst1 + hqr_cabs1(h(k + 4, k + 1));
+            }
+            if(hqr_cabs1(h(k + 1, k)) <= std::max(smlnum, ulp * tst1))
+            {
+                S h12 = std::max(hqr_cabs1(h(k + 1, k)), hqr_cabs1(h(k, k + 1)));
+                S h21 = std::min(hqr_cabs1(h(k + 1, k)), hqr_cabs1(h(k, k + 1)));
+                S h11 = std::max(hqr_cabs1(h(k + 1, k + 1)), hqr_cabs1(h(k, k) - h(k + 1, k + 1)));
+                S h22 = std::min(hqr_cabs1(h(k + 1, k + 1)), hqr_cabs1(h(k, k) - h(k + 1, k + 1)));
+                S scl = h11 + h12;
+                S tst2 = h22 * (h11 / scl);
+                if(tst2 == 0 || h21 * (h12 / scl) <= std::max(smlnum, ulp * tst2))
+                    h(k + 1, k) = T(0);
+            }
+        }
+    };
+
+    const I krlast = std::min(incol + 3 * nbmps - 3, kbot - 2);
+    for(I krcol = incol; krcol <= krlast; krcol++)
+    {
+        // Bulges number mtop to mbot are active double implicit shift bulges. There may
+        // or may not also be a small 2-by-2 bulge, if there is room. (Fortran integer
+        // division truncates toward zero, as in C++.)
+        const I mtop = std::max(I(1), ((ktop - 1) - krcol + 2) / 3 + 1);
+        const I mbot = std::min(nbmps, (kbot - krcol) / 3);
+        const I m22 = mbot + 1;
+        const bool bmp22 = (mbot < nbmps) && (krcol + 3 * (m22 - 1) == kbot - 2);
+
+        // 1. generate reflections to chase the chain right one column (one thread per
+        //    bulge; the bulges read and write disjoint entries of H)
+        for(I m = mtop + tid; m <= mbot; m += BS)
+        {
+            const I k = krcol + 3 * (m - 1);
+            T v3[3];
+            if(k == ktop - 1)
+            {
+                hqr_laqr1(3, &h(ktop, ktop), ldh, s(2 * m - 1), s(2 * m), v3);
+                T alpha = v3[0];
+                T tau;
+                hqr_larfg<3>(alpha, v3 + 1, tau);
+                v3[0] = tau;
+            }
+            else
+            {
+                T beta = h(k + 1, k);
+                v3[1] = h(k + 2, k);
+                v3[2] = h(k + 3, k);
+                T tau;
+                hqr_larfg<3>(beta, v3 + 1, tau);
+                v3[0] = tau;
+
+                // A bulge may collapse because of vigilant deflation or destructive
+                // underflow. In the underflow case, try the two-small-subdiagonals trick
+                // to try to reinflate the bulge.
+                if(h(k + 3, k) != T(0) || h(k + 3, k + 1) != T(0) || h(k + 3, k + 2) == T(0))
+                {
+                    // typical case: not collapsed (yet)
+                    h(k + 1, k) = beta;
+                    h(k + 2, k) = T(0);
+                    h(k + 3, k) = T(0);
+                }
+                else
+                {
+                    // atypical case: collapsed. Attempt to reintroduce ignoring h(k+1,k)
+                    // and h(k+2,k). If the fill resulting from the new reflector is too
+                    // large, then abandon it. Otherwise, use the new one.
+                    T vt[3];
+                    hqr_laqr1(3, &h(k + 1, k + 1), ldh, s(2 * m - 1), s(2 * m), vt);
+                    T alpha = vt[0];
+                    T taut;
+                    hqr_larfg<3>(alpha, vt + 1, taut);
+                    vt[0] = taut;
+                    T refsum = conj(vt[0]) * (h(k + 1, k) + conj(vt[1]) * h(k + 2, k));
+
+                    if(hqr_cabs1(h(k + 2, k) - refsum * vt[1]) + hqr_cabs1(refsum * vt[2]) > ulp
+                           * (hqr_cabs1(h(k, k)) + hqr_cabs1(h(k + 1, k + 1))
+                              + hqr_cabs1(h(k + 2, k + 2))))
+                    {
+                        // starting a new bulge here would create non-negligible fill;
+                        // use the old one with trepidation
+                        h(k + 1, k) = beta;
+                        h(k + 2, k) = T(0);
+                        h(k + 3, k) = T(0);
+                    }
+                    else
+                    {
+                        // starting a new bulge here would create only negligible fill;
+                        // replace the old reflector with the new one
+                        h(k + 1, k) = h(k + 1, k) - refsum;
+                        h(k + 2, k) = T(0);
+                        h(k + 3, k) = T(0);
+                        v3[0] = vt[0];
+                        v3[1] = vt[1];
+                        v3[2] = vt[2];
+                    }
+                }
+            }
+            vv(1, m) = v3[0];
+            vv(2, m) = v3[1];
+            vv(3, m) = v3[2];
+        }
+
+        // generate a 2-by-2 reflection, if needed
+        if(bmp22 && tid == BS - 1)
+        {
+            const I k = krcol + 3 * (m22 - 1);
+            T v2[2];
+            if(k == ktop - 1)
+            {
+                hqr_laqr1(2, &h(k + 1, k + 1), ldh, s(2 * m22 - 1), s(2 * m22), v2);
+                T beta = v2[0];
+                T tau;
+                hqr_larfg<2>(beta, v2 + 1, tau);
+                v2[0] = tau;
+            }
+            else
+            {
+                T beta = h(k + 1, k);
+                v2[1] = h(k + 2, k);
+                T tau;
+                hqr_larfg<2>(beta, v2 + 1, tau);
+                v2[0] = tau;
+                h(k + 1, k) = beta;
+                h(k + 2, k) = T(0);
+            }
+            vv(1, m22) = v2[0];
+            vv(2, m22) = v2[1];
+            vv(3, m22) = T(0);
+        }
+        __syncthreads();
+
+        // 2. multiply H by reflections from the left (the bulges act on disjoint rows)
+        const I jbot = accum ? std::min(ndcol, kbot) : (wantt ? n : kbot);
+        for(I j = std::max(ktop, krcol) + tid; j <= jbot; j += BS)
+        {
+            const I mend = std::min(mbot, (j - krcol + 2) / 3);
+            for(I m = mtop; m <= mend; m++)
+            {
+                const I k = krcol + 3 * (m - 1);
+                T refsum = conj(vv(1, m))
+                    * (h(k + 1, j) + conj(vv(2, m)) * h(k + 2, j) + conj(vv(3, m)) * h(k + 3, j));
+                h(k + 1, j) = h(k + 1, j) - refsum;
+                h(k + 2, j) = h(k + 2, j) - refsum * vv(2, m);
+                h(k + 3, j) = h(k + 3, j) - refsum * vv(3, m);
+            }
+            if(bmp22)
+            {
+                const I k = krcol + 3 * (m22 - 1);
+                if(j >= std::max(k + 1, ktop))
+                {
+                    T refsum = conj(vv(1, m22)) * (h(k + 1, j) + conj(vv(2, m22)) * h(k + 2, j));
+                    h(k + 1, j) = h(k + 1, j) - refsum;
+                    h(k + 2, j) = h(k + 2, j) - refsum * vv(2, m22);
+                }
+            }
+        }
+        __syncthreads();
+
+        // 3. multiply H by reflections from the right, and accumulate them in U (or apply
+        //    them to Z). Delay filling in the last row until the vigilant deflation check
+        //    is complete. The bulges act on disjoint columns, so all the (bulge, row) pairs
+        //    are independent and are distributed among the threads.
+        const I jtop = accum ? std::max(ktop, incol) : (wantt ? I(1) : ktop);
+        {
+            const I mlast = mbot + (bmp22 ? 1 : 0);
+            const I nb = mlast - mtop + 1;
+
+            // apply the reflection of bulge m (2-by-2 if m == m22) from the right to the
+            // pair or triplet of columns starting at column c of the matrix A
+            auto apply_right = [&](const I m, T& a1, T& a2, T& a3) {
+                const T v1 = vv(1, m);
+                const T v2 = vv(2, m);
+                if(m == m22 && bmp22)
+                {
+                    T refsum = v1 * (a1 + v2 * a2);
+                    a1 = a1 - refsum;
+                    a2 = a2 - refsum * conj(v2);
+                }
+                else
+                {
+                    const T v3 = vv(3, m);
+                    T refsum = v1 * (a1 + v2 * a2 + v3 * a3);
+                    a1 = a1 - refsum;
+                    a2 = a2 - refsum * conj(v2);
+                    a3 = a3 - refsum * conj(v3);
+                }
+            };
+
+            // H: rows jtop:min(kbot,k+3) of each bulge (the range of the last bulge is the
+            // longest; shorter ranges skip the extra rows)
+            if(nb > 0)
+            {
+                const I kmax = krcol + 3 * (mlast - 1);
+                const I nrows = std::min(kbot, kmax + 3) - jtop + 1;
+                for(I idx = tid; idx < nb * nrows; idx += BS)
+                {
+                    const I m = mtop + idx / nrows;
+                    const I j = jtop + idx % nrows;
+                    const I k = krcol + 3 * (m - 1);
+                    if(vv(1, m) == T(0) || j > std::min(kbot, k + 3))
+                        continue;
+                    T a3dummy = T(0);
+                    T& a3 = (m == m22 && bmp22) ? a3dummy : h(j, k + 3);
+                    apply_right(m, h(j, k + 1), h(j, k + 2), a3);
+                }
+            }
+
+            if(accum && nb > 0)
+            {
+                // accumulate U (if necessary, Z is updated later with a matrix-matrix
+                // multiply)
+                const I j0 = std::max(I(1), ktop - incol);
+                const I nrows = kdu - j0 + 1;
+                for(I idx = tid; idx < nb * nrows; idx += BS)
+                {
+                    const I m = mtop + idx / nrows;
+                    const I j = j0 + idx % nrows;
+                    if(vv(1, m) == T(0))
+                        continue;
+                    const I kms = krcol + 3 * (m - 1) - incol;
+                    T a3dummy = T(0);
+                    T& a3 = (m == m22 && bmp22) ? a3dummy : u(j, kms + 3);
+                    apply_right(m, u(j, kms + 1), u(j, kms + 2), a3);
+                }
+            }
+            else if(wantz && nb > 0)
+            {
+                // U is not accumulated, so update Z now by multiplying by reflections from
+                // the right
+                const I nrows = ihiz - iloz + 1;
+                for(I idx = tid; idx < nb * nrows; idx += BS)
+                {
+                    const I m = mtop + idx / nrows;
+                    const I j = iloz + idx % nrows;
+                    if(vv(1, m) == T(0))
+                        continue;
+                    const I k = krcol + 3 * (m - 1);
+                    T a3dummy = T(0);
+                    T& a3 = (m == m22 && bmp22) ? a3dummy : z(j, k + 3);
+                    apply_right(m, z(j, k + 1), z(j, k + 2), a3);
+                }
+            }
+        }
+        __syncthreads();
+
+        // 4. vigilant deflation check (one thread per bulge; the checks of bulges three rows
+        //    apart read and write disjoint entries). At the bottom (krcol = kbot-2) the
+        //    checks at k = kbot-2 and k = kbot-1 are one row apart: each may read the
+        //    subdiagonal entry that the other one sets to zero, so all the checks of this
+        //    step run in order on one thread, as in LAPACK.
+        {
+            I mstart = mtop;
+            if(krcol + 3 * (mstart - 1) < ktop)
+                mstart = mstart + 1;
+            I mend = mbot;
+            if(bmp22)
+                mend = mend + 1;
+            if(krcol == kbot - 2)
+            {
+                mend = mend + 1;
+                if(tid == 0)
+                    for(I m = mstart; m <= mend; m++)
+                        vigilant(std::min(kbot - 1, krcol + 3 * (m - 1)));
+            }
+            else
+            {
+                for(I m = mstart + tid; m <= mend; m += BS)
+                    vigilant(std::min(kbot - 1, krcol + 3 * (m - 1)));
+            }
+        }
+        __syncthreads();
+
+        // 5. fill in the last row of each bulge
+        {
+            const I mend = std::min(nbmps, (kbot - krcol - 1) / 3);
+            for(I m = mtop + tid; m <= mend; m += BS)
+            {
+                const I k = krcol + 3 * (m - 1);
+                T refsum = vv(1, m) * vv(3, m) * h(k + 4, k + 3);
+                h(k + 4, k + 1) = -refsum;
+                h(k + 4, k + 2) = -refsum * conj(vv(2, m));
+                h(k + 4, k + 3) = h(k + 4, k + 3) - refsum * conj(vv(3, m));
+            }
+        }
+        __syncthreads();
+    }
+}
+
+/** Indices of the status array of the multishift QR iteration. **/
+enum laqr0_status_index
+{
+    LAQR0_KTOP = 0,
+    LAQR0_NW,
+    LAQR0_NDEC,
+    LAQR0_LS,
+    LAQR0_LD,
+    LAQR0_JW,
+    LAQR0_KWTOP,
+    LAQR0_UPDATE,
+    LAQR0_SWEEP,
+    LAQR0_NS,
+    LAQR0_KS,
+    LAQR0_KBOT,
+    LAQR0_CORE,
+    LAQR0_TOOFEW,
+    LAQR0_STATUS_SIZE
+};
+
+/** Indices of the (complex) scalar status array of the multishift QR iteration. **/
+enum laqr0_status_scalar_index
+{
+    LAQR0_SPIKE_IN = 0,
+    LAQR0_SPIKE_OUT,
+    LAQR0_STATUS_SCALAR_SIZE
+};
+
+/** LAQR0_SHIFTS_TAIL finishes the shift selection of ZLAQR0 once the candidate
+    shifts W(ks:kbot2) are known (W(i) is Wb[i - wb]): if fail (ZLAHQR could not
+    compute the eigenvalues of the trailing submatrix), it uses the eigenvalues of the
+    trailing 2-by-2 block hb = H(kbot2-1:kbot2, kbot2-1:kbot2) (column-major; only
+    hb[3] = H(kbot2,kbot2) is needed otherwise), if sort it sorts the shifts, and then
+    it chooses the ns shifts to use, W(ks:kbot2) on exit. On the device it is
+    executed by all the threads of a thread-block of BS threads; on the host, with
+    BS = 1. **/
+template <int BS, typename T, typename I>
+__host__ __device__ void laqr0_shifts_tail(const bool sort,
+                                           const bool fail,
+                                           I& ns,
+                                           I& ks,
+                                           const I kbot2,
+                                           T* Wb,
+                                           const I wb,
+                                           const T* hb)
+{
+    using S = decltype(std::real(T{}));
+
+    const I tid = hqr_tid();
+    auto w = [&](const I i) -> T& { return Wb[i - wb]; };
+
+    if(fail)
+    {
+        // in case of a rare QR failure use eigenvalues of the trailing 2-by-2
+        // principal submatrix; scale to avoid overflows, underflows and subnormals
+        S sc = hqr_cabs1(hb[0]) + hqr_cabs1(hb[1]) + hqr_cabs1(hb[2]) + hqr_cabs1(hb[3]);
+        T aa = hb[0] / sc;
+        T cc = hb[1] / sc;
+        T bb = hb[2] / sc;
+        T dd = hb[3] / sc;
+        T tr2 = (aa + dd) / S(2);
+        T det = (aa - tr2) * (dd - tr2) - bb * cc;
+        T rtdisc = hqr_csqrt(T(-det.real(), -det.imag()));
+        hqr_sync();
+        if(tid == 0)
+        {
+            w(kbot2 - 1) = sc * (tr2 + rtdisc);
+            w(kbot2) = sc * (tr2 - rtdisc);
+        }
+        ks = kbot2 - 1;
+    }
+
+    if(sort && kbot2 - ks + 1 > ns)
+    {
+        // sort the shifts (helps a little): bubble sort into decreasing |Re|+|Im|
+        hqr_sync();
+        if(tid == 0)
+        {
+            bool sorted = false;
+            for(I k = kbot2; k >= ks + 1 && !sorted; k--)
+            {
+                sorted = true;
+                for(I i = ks; i <= k - 1; i++)
+                {
+                    if(hqr_cabs1(w(i)) < hqr_cabs1(w(i + 1)))
+                    {
+                        sorted = false;
+                        T swp = w(i);
+                        w(i) = w(i + 1);
+                        w(i + 1) = swp;
+                    }
+                }
+            }
+        }
+    }
+    hqr_sync();
+
+    // if there are only two shifts, then use only one
+    if(kbot2 - ks + 1 == 2)
+    {
+        T w1 = w(kbot2 - 1);
+        T w2 = w(kbot2);
+        T hkk = hb[3];
+        hqr_sync();
+        if(tid == 0)
+        {
+            if(hqr_cabs1(w2 - hkk) < hqr_cabs1(w1 - hkk))
+                w(kbot2 - 1) = w2;
+            else
+                w(kbot2) = w1;
+        }
+    }
+
+    // use up to ns of the smallest magnitude shifts; if there are not ns shifts
+    // available, then use them all, possibly dropping one to make the number of
+    // shifts even
+    ns = std::min(ns, kbot2 - ks + 1);
+    ns = ns - ns % 2;
+    ks = kbot2 - ns + 1;
+}
+
+/*
+ * ===========================================================================
+ *    One iteration of the main loop of LAPACK ZLAQR0 (version 3.9.0, whose
+ *    workspace bounds, e.g. NSMAX = (n+6)/9, match the sweep of laqr5_chunk_block;
+ *    3.12 uses NSMAX = (n-3)/6), except for the off-window updates of the AED, the
+ *    extra shifts when the AED provides too few (laqr0_toofew_block) and the sweep
+ *    itself, which are left to the caller. Unlike LAPACK, the Schur forms of the
+ *    deflation window and of the too-few-shifts submatrix always use ZLAHQR, where
+ *    LAPACK calls ZLAQR4 for sizes above NMIN = 75 (the window is capped by
+ *    HSEQR_AED_WINDOW_MAX, but can still grow to (n-1)/3 when the iterations stall).
+ *    It is split in two parts around the core of the aggressive early deflation
+ *    (aed_core_block), which runs on the device (laqr0_iteration_block) or on the
+ *    host (hybrid mode):
+ *    - laqr0_part1_block: locate the active block (ktop: the last exact zero on the
+ *      subdiagonal), select the deflation window size (nw, ndec), and set up the
+ *      AED, using the workspace below the subdiagonal of H as in LAPACK
+ *      (V = H(kv,1), T = H(kv,kt), work = H(kwv,1));
+ *    - laqr0_part2_block: finish the AED, decide whether a sweep is needed and, if so,
+ *      select the shifts (the AED shifts or exceptional shifts), leaving them in
+ *      W(ks:kbot); if the AED provides too few, it sets status[LAQR0_TOOFEW] and the
+ *      caller completes the selection with laqr0_toofew_block after the off-window
+ *      updates.
+ *    The caller provides kbot, ndfl, and the previous nw and ndec; nwr, nwmax, nsr
+ *    and nsmax are the tuning parameters of ZLAQR0 (with an unlimited LWORK). The
+ *    results are left in status (see laqr0_status_index) and statusT.
+ * ===========================================================================
+ */
+template <int BS, typename T, typename I>
+__device__ void laqr0_part1_block(const I n,
+                                  const I ilo,
+                                  const I kbot,
+                                  const I ndfl,
+                                  const I nw_prev,
+                                  const I ndec_prev,
+                                  const I nwr,
+                                  const I nwmax,
+                                  T* H,
+                                  const I ldh,
+                                  T* W,
+                                  I* status,
+                                  T* statusT,
+                                  I (*s_ired)[HQR_RED(BS)],
+                                  int& ibuf)
+{
+    const I tid = hqr_tid();
+    auto h = [&](const I i, const I j) -> T& { return H[idx2D(i - 1, j - 1, ldh)]; };
+
+    constexpr I kexnw = 5;
+
+    // locate active block
+    I kfound = 0;
+    for(I k = kbot - tid; k >= ilo + 1; k -= BS)
+    {
+        if(h(k, k - 1) == T(0))
+        {
+            kfound = k;
+            break;
+        }
+    }
+    kfound = hqr_block_max<BS>(kfound, s_ired, ibuf);
+    const I ktop = (kfound > 0) ? kfound : ilo;
+
+    // select deflation window size
+    const I nh = kbot - ktop + 1;
+    const I nwupbd = std::min(nh, nwmax);
+    I nw = (ndfl < kexnw) ? std::min(nwupbd, nwr) : std::min(nwupbd, 2 * nw_prev);
+    if(nw < nwmax)
+    {
+        if(nw >= nh - 1)
+            nw = nh;
+        else
+        {
+            const I kwtop = kbot - nw + 1;
+            if(hqr_cabs1(h(kwtop, kwtop - 1)) > hqr_cabs1(h(kwtop - 1, kwtop - 2)))
+                nw = nw + 1;
+        }
+    }
+    I ndec = ndec_prev;
+    if(ndfl < kexnw)
+        ndec = -1;
+    else if(ndec >= 0 || nw >= nwupbd)
+    {
+        ndec = ndec + 1;
+        if(nw - ndec < 2)
+            ndec = 0;
+        nw = nw - ndec;
+    }
+
+    // set up the aggressive early deflation, with the workspace below the subdiagonal
+    const I kv = n - nw + 1;
+    const I kt = nw + 1;
+    I jw, kwtop, ns, nd;
+    T s;
+    const bool core = aed_setup_block<BS>(n, ktop, kbot, nw, H, ldh, W, &h(kv, kt), ldh, &h(kv, 1),
+                                          ldh, jw, kwtop, s, ns, nd);
+
+    if(tid == 0)
+    {
+        status[LAQR0_KTOP] = ktop;
+        status[LAQR0_NW] = nw;
+        status[LAQR0_NDEC] = ndec;
+        status[LAQR0_JW] = jw;
+        status[LAQR0_KWTOP] = kwtop;
+        status[LAQR0_CORE] = core ? 1 : 0;
+        status[LAQR0_LS] = ns;
+        status[LAQR0_LD] = nd;
+        status[LAQR0_UPDATE] = 0;
+        statusT[LAQR0_SPIKE_IN] = s;
+        statusT[LAQR0_SPIKE_OUT] = T(0);
+    }
+    __syncthreads();
+}
+
+template <int BS, typename T, typename I>
+__device__ void laqr0_part2_block(const I n,
+                                  const I kbot,
+                                  const I ndfl,
+                                  const I nwmax,
+                                  const I nsr,
+                                  const I nsmax,
+                                  T* H,
+                                  const I ldh,
+                                  T* W,
+                                  I* status,
+                                  T* statusT,
+                                  I (*s_ired)[HQR_RED(BS)],
+                                  int& ibuf)
+{
+    using S = decltype(std::real(T{}));
+
+    const I tid = hqr_tid();
+    auto h = [&](const I i, const I j) -> T& { return H[idx2D(i - 1, j - 1, ldh)]; };
+
+    constexpr I kexsh = 6;
+    constexpr I nmin = 75;
+    constexpr I nibble = 14;
+    const S wilk1 = S(0.75);
+
+    const I ktop = status[LAQR0_KTOP];
+    const I nw = status[LAQR0_NW];
+    const I jw = status[LAQR0_JW];
+    const I kwtop = status[LAQR0_KWTOP];
+    const I ls = status[LAQR0_LS];
+    const I ld = status[LAQR0_LD];
+    const bool update = status[LAQR0_UPDATE] != 0;
+    const T spike = statusT[LAQR0_SPIKE_OUT];
+    const I kt = nw + 1;
+    const I kv = n - nw + 1;
+    __syncthreads();
+
+    // finish the aggressive early deflation
+    aed_finish_block<BS>(kwtop, jw, H, ldh, &h(kv, kt), ldh, update, spike);
+
+    // adjust kbot accounting for new deflations; ks points to the shifts
+    const I kbot2 = kbot - ld;
+    I ks = kbot2 - ls + 1;
+
+    // skip an expensive QR sweep if there is a (partly heuristic) reason to expect that
+    // many eigenvalues will deflate without it
+    const bool sweep
+        = (ld == 0) || ((100 * ld <= nw * nibble) && (kbot2 - ktop + 1 > std::min(nmin, nwmax)));
+    I ns = 0;
+    if(sweep)
+    {
+        // nominal number of simultaneous shifts
+        ns = std::min(nsmax, std::min(nsr, std::max(I(2), kbot2 - ktop)));
+        ns = ns - ns % 2;
+
+        const bool exceptional = (ndfl % kexsh == 0);
+        if(exceptional)
+        {
+            // exceptional shifts
+            ks = kbot2 - ns + 1;
+            __syncthreads();
+            for(I i = kbot2 - 2 * tid; i >= ks + 1; i -= 2 * BS)
+            {
+                T wi = T(h(i, i).real() + wilk1 * hqr_cabs1(h(i, i - 1)), h(i, i).imag());
+                W[i - 1] = wi;
+                W[i - 2] = wi;
+            }
+        }
+        else if(kbot2 - ks + 1 <= ns / 2)
+        {
+            // got ns/2 or fewer shifts? They are computed later, by laqr0_toofew_block,
+            // from the trailing ns-by-ns submatrix H(ks:kbot2, ks:kbot2), once the
+            // off-window updates of the AED (which change its rows above the window) are
+            // done, as in LAPACK
+            ks = kbot2 - ns + 1;
+            __syncthreads();
+            if(tid == 0)
+            {
+                status[LAQR0_SWEEP] = 1;
+                status[LAQR0_NS] = ns;
+                status[LAQR0_KS] = ks;
+                status[LAQR0_KBOT] = kbot2;
+                status[LAQR0_TOOFEW] = 1;
+            }
+            return;
+        }
+
+        // trailing 2-by-2 block of the active part
+        T hb[4];
+        hb[3] = h(kbot2, kbot2);
+        if(kbot2 >= 2)
+        {
+            hb[0] = h(kbot2 - 1, kbot2 - 1);
+            hb[1] = h(kbot2, kbot2 - 1);
+            hb[2] = h(kbot2 - 1, kbot2);
+        }
+        laqr0_shifts_tail<BS>(!exceptional, false, ns, ks, kbot2, W, I(1), hb);
+    }
+    __syncthreads();
+
+    if(tid == 0)
+    {
+        status[LAQR0_TOOFEW] = 0;
+        status[LAQR0_SWEEP] = sweep ? 1 : 0;
+        status[LAQR0_NS] = ns;
+        status[LAQR0_KS] = ks;
+        status[LAQR0_KBOT] = kbot2;
+    }
+}
+
+/** LAQR0_TOOFEW_BLOCK completes the shift selection when the AED provided too few
+    shifts (status[LAQR0_TOOFEW] set by laqr0_part2_block): the shifts are the
+    eigenvalues of the trailing submatrix H(ks:kbot2, ks:kbot2) (ns-by-ns), computed
+    with ZLAHQR in the workspace H(n-ns+1:n, 1:ns) below the subdiagonal. It must run
+    after the off-window updates of the AED.
+    Test coverage: with the default settings (ns capped at the deflation window),
+    this path is only reached when the window has shrunk after several iterations
+    without deflations, or when the ZLAHQR of the window fails, and no test matrix is
+    known to reach it reliably (a large deflation skips the sweep instead). It was
+    verified with the cap disabled at n = 3000, where it runs in nearly every sweep. **/
+template <int BS, typename T, typename I>
+__device__ void
+    laqr0_toofew_block(const I n, T* H, const I ldh, T* W, I* status, I (*s_ired)[HQR_RED(BS)], int& ibuf)
+{
+    const I tid = hqr_tid();
+    auto h = [&](const I i, const I j) -> T& { return H[idx2D(i - 1, j - 1, ldh)]; };
+
+    I ns = status[LAQR0_NS];
+    I ks = status[LAQR0_KS];
+    const I kbot2 = status[LAQR0_KBOT];
+    const I kt = n - ns + 1;
+    __syncthreads();
+
+    // trailing 2-by-2 block of the active part
+    T hb[4];
+    hb[0] = h(kbot2 - 1, kbot2 - 1);
+    hb[1] = h(kbot2, kbot2 - 1);
+    hb[2] = h(kbot2 - 1, kbot2);
+    hb[3] = h(kbot2, kbot2);
+
+    for(I j = 0; j < ns; j++)
+        for(I i = tid; i < ns; i += BS)
+            h(kt + i, 1 + j) = h(ks + i, ks + j);
+    __syncthreads();
+    const I inf = lahqr_block<BS>(false, false, ns, I(1), ns, &h(kt, 1), ldh, W + (ks - 1), I(1),
+                                  I(1), (T*)nullptr, I(1), s_ired, ibuf);
+    __syncthreads();
+    ks = ks + inf;
+
+    laqr0_shifts_tail<BS>(true, ks >= kbot2, ns, ks, kbot2, W, I(1), hb);
+    __syncthreads();
+
+    if(tid == 0)
+    {
+        status[LAQR0_NS] = ns;
+        status[LAQR0_KS] = ks;
+        status[LAQR0_TOOFEW] = 0;
+    }
+}
+
+/** LAQR0_ITERATION_BLOCK runs one iteration (both parts and the AED core) on the
+    device. **/
+template <int BS, typename T, typename I>
+__device__ void laqr0_iteration_block(const I n,
+                                      const I ilo,
+                                      const I kbot,
+                                      const I ndfl,
+                                      const I nw_prev,
+                                      const I ndec_prev,
+                                      const I nwr,
+                                      const I nwmax,
+                                      const I nsr,
+                                      const I nsmax,
+                                      T* H,
+                                      const I ldh,
+                                      T* W,
+                                      I* status,
+                                      T* statusT)
+{
+    using S = decltype(std::real(T{}));
+    __shared__ I s_ired[2][HQR_RED(BS)];
+    __shared__ S s_sred[2][HQR_RED(BS)];
+    int ibuf = 0, sbuf = 0;
+
+    const I tid = hqr_tid();
+    auto h = [&](const I i, const I j) -> T& { return H[idx2D(i - 1, j - 1, ldh)]; };
+
+    laqr0_part1_block<BS>(n, ilo, kbot, ndfl, nw_prev, ndec_prev, nwr, nwmax, H, ldh, W, status,
+                          statusT, s_ired, ibuf);
+
+    if(status[LAQR0_CORE])
+    {
+        const I nw = status[LAQR0_NW];
+        const I jw = status[LAQR0_JW];
+        const I kwtop = status[LAQR0_KWTOP];
+        const T s = statusT[LAQR0_SPIKE_IN];
+        const I kv = n - nw + 1;
+        const I kt = nw + 1;
+        const I kwv = nw + 2;
+        I ns, nd;
+        bool update;
+        T spike;
+        __syncthreads();
+        aed_core_block<BS>(n, jw, s, &h(kv, kt), ldh, &h(kv, 1), ldh, &h(kwv, 1), W + (kwtop - 1),
+                           ns, nd, update, spike, s_ired, s_sred, ibuf, sbuf);
+        if(tid == 0)
+        {
+            status[LAQR0_LS] = ns;
+            status[LAQR0_LD] = nd;
+            status[LAQR0_UPDATE] = update ? 1 : 0;
+            statusT[LAQR0_SPIKE_OUT] = spike;
+        }
+    }
+    __syncthreads();
+
+    laqr0_part2_block<BS>(n, kbot, ndfl, nwmax, nsr, nsmax, H, ldh, W, status, statusT, s_ired, ibuf);
+}
+
+ROCSOLVER_END_NAMESPACE

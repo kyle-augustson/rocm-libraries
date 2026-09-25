@@ -136,6 +136,12 @@ if(BUILD_CLIENTS_BENCHMARKS OR BUILD_CLIENTS_TESTS)
     common/lapack/testing_gels.cpp
     common/lapack/testing_gebd2_gebrd.cpp
     common/lapack/testing_gehd2_gehrd.cpp
+    common/lapack/testing_gebal.cpp
+    common/lapack/testing_gebak.cpp
+    common/lapack/testing_hseqr.cpp
+    common/lapack/testing_trexc.cpp
+    common/lapack/testing_trevc3.cpp
+    common/lapack/testing_geev.cpp
     common/lapack/testing_sytf2_sytrf.cpp
     common/lapack/testing_sytrs.cpp
     common/lapack/testing_sytrs2.cpp

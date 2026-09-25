@@ -57,6 +57,12 @@ set(roclapack_test_source
   # problem and matrix reductions (diagonalizations)
   lapack/gebd2_gebrd_gtest.cpp
   lapack/gehd2_gehrd_gtest.cpp
+  lapack/gebal_gtest.cpp
+  lapack/gebak_gtest.cpp
+  lapack/hseqr_gtest.cpp
+  lapack/trexc_gtest.cpp
+  lapack/trevc3_gtest.cpp
+  lapack/geev_gtest.cpp
   lapack/sytxx_hetxx_gtest.cpp
   lapack/sygsx_hegsx_gtest.cpp
   # singular value decomposition
@@ -265,6 +271,18 @@ if(ROCSOLVER_ENABLE_EIG_2STAGE)
 endif()
 if(ROCSOLVER_ENABLE_XXGHR)
   target_compile_definitions(rocsolver-test PRIVATE ROCSOLVER_ENABLE_XXGHR)
+endif()
+if(ROCSOLVER_ENABLE_BALANCE)
+  target_compile_definitions(rocsolver-test PRIVATE ROCSOLVER_ENABLE_BALANCE)
+endif()
+if(ROCSOLVER_ENABLE_HSEQR)
+  target_compile_definitions(rocsolver-test PRIVATE ROCSOLVER_ENABLE_HSEQR)
+endif()
+if(ROCSOLVER_ENABLE_TREVC)
+  target_compile_definitions(rocsolver-test PRIVATE ROCSOLVER_ENABLE_TREVC)
+endif()
+if(ROCSOLVER_ENABLE_GEEV)
+  target_compile_definitions(rocsolver-test PRIVATE ROCSOLVER_ENABLE_GEEV)
 endif()
 
 add_test(

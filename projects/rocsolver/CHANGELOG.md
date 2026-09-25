@@ -7,6 +7,18 @@ Full documentation for rocSOLVER is available at the [rocSOLVER documentation](h
 
 ### Added
 
+* Eigenvalues and Schur factorization of Hessenberg matrices
+    * HSEQR (complex precisions)
+    * TREXC (complex precisions)
+    * TREVC3 (complex precisions)
+
+* Eigensolver for general matrices
+    * GEEV (complex precisions)
+
+* Balancing routines for general matrices
+    * GEBAL
+    * GEBAK
+
 * Orthonormal/Unitary matrix generator routines from Hessenberg reduction
     * ORGHR and UNGHR
 
