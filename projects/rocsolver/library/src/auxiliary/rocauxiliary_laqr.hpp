@@ -1014,6 +1014,74 @@ __device__ void laqr5_build_u_block(const I ktop,
     }
 }
 
+/** LAQR5_LEFT_APPLY_BLOCK applies the reflections of one chunk of the sweep, stored in
+    Vbuf by laqr5_chunk_block (with accum), from the left to column j > ndcol of H, as
+    the chase does to the columns of its window (rows incol+1:ndcol; phase 2 of each
+    step). The column is kept in shared memory (col, kdu entries); the bulges of a step
+    act on disjoint rows. This updates the columns that the next chunk will use, so that
+    the matrix-matrix products with U can run concurrently with the next chunk. **/
+template <int BS, typename T, typename I>
+__device__ void laqr5_left_apply_block(const I n,
+                                       const I ktop,
+                                       const I kbot,
+                                       const I nbmps,
+                                       const I incol,
+                                       const T* Vbuf,
+                                       T* H,
+                                       const I ldh,
+                                       const I j,
+                                       T* col)
+{
+    const I tid = hipThreadIdx_x;
+    const I kdu = 6 * nbmps - 3;
+    const I ldvb = 3 * (nbmps + 1);
+    const I r0 = std::max(incol + 1, I(1));
+    const I r1 = std::min(incol + kdu, n);
+    auto c = [&](const I r) -> T& { return col[r - incol - 1]; };
+
+    for(I r = r0 + tid; r <= r1; r += BS)
+        c(r) = H[idx2D(r - 1, j - 1, ldh)];
+    __syncthreads();
+
+    const I krlast = std::min(incol + 3 * nbmps - 3, kbot - 2);
+    for(I krcol = incol; krcol <= krlast; krcol++)
+    {
+        const I mtop = std::max(I(1), ((ktop - 1) - krcol + 2) / 3 + 1);
+        const I mbot = std::min(nbmps, (kbot - krcol) / 3);
+        const I m22 = mbot + 1;
+        const bool bmp22 = (mbot < nbmps) && (krcol + 3 * (m22 - 1) == kbot - 2);
+        const I mlast = mbot + (bmp22 ? 1 : 0);
+        const T* vb = Vbuf + (krcol - incol) * ldvb;
+        for(I m = mtop + tid; m <= mlast; m += BS)
+        {
+            const I k = krcol + 3 * (m - 1);
+            const T v1 = vb[3 * (m - 1)];
+            const T v2 = vb[3 * (m - 1) + 1];
+            if(bmp22 && m == m22)
+            {
+                if(j >= std::max(k + 1, ktop))
+                {
+                    T refsum = conj(v1) * (c(k + 1) + conj(v2) * c(k + 2));
+                    c(k + 1) = c(k + 1) - refsum;
+                    c(k + 2) = c(k + 2) - refsum * v2;
+                }
+            }
+            else if(j >= k + 1)
+            {
+                const T v3 = vb[3 * (m - 1) + 2];
+                T refsum = conj(v1) * (c(k + 1) + conj(v2) * c(k + 2) + conj(v3) * c(k + 3));
+                c(k + 1) = c(k + 1) - refsum;
+                c(k + 2) = c(k + 2) - refsum * v2;
+                c(k + 3) = c(k + 3) - refsum * v3;
+            }
+        }
+        __syncthreads();
+    }
+
+    for(I r = r0 + tid; r <= r1; r += BS)
+        H[idx2D(r - 1, j - 1, ldh)] = c(r);
+}
+
 /** Indices of the status array of the multishift QR iteration. **/
 enum laqr0_status_index
 {

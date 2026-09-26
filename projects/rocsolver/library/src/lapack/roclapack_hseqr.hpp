@@ -411,6 +411,61 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) laqr5_build_u_kernel(const I ktop,
                             ldu);
 }
 
+/** LAQR5_LEFT_APPLY_KERNEL applies the reflections of a chunk from the left to the
+    columns j0:j0+gridDim.x-1 of H (laqr5_left_apply_block), one thread-block per column. **/
+template <int BS, typename T, typename I>
+ROCSOLVER_KERNEL void __launch_bounds__(BS) laqr5_left_apply_kernel(const I n,
+                                                                    const I ktop,
+                                                                    const I kbot,
+                                                                    const I nbmps,
+                                                                    const I incol,
+                                                                    const T* Vbuf,
+                                                                    T* H,
+                                                                    const I ldh,
+                                                                    const I j0)
+{
+    extern __shared__ double lmem[];
+    laqr5_left_apply_block<BS>(n, ktop, kbot, nbmps, incol, Vbuf, H, ldh, j0 + I(hipBlockIdx_x),
+                               reinterpret_cast<T*>(lmem));
+}
+
+/** HSEQR_SIDE_STREAM holds the second stream (and its events) on which the formation of U
+    and the far-from-diagonal updates of each chunk of the sweep run, concurrently with
+    the next chunk. It is created when first needed and destroyed with the object, after
+    the work of both streams is complete: the main stream waits for the side stream at the
+    end of each sweep, but that wait may still be pending on the device when the host
+    returns, and it must not refer to a destroyed event (the work of the side stream would
+    then outlive the call). **/
+struct hseqr_side_stream
+{
+    hipStream_t s0 = nullptr; // main stream
+    hipStream_t s1 = nullptr;
+    hipEvent_t chased[2] = {nullptr, nullptr}; // chunk kernel done (Vbuf and H ready)
+    hipEvent_t ubuilt[2] = {nullptr, nullptr}; // U formed (Vbuf slot free again)
+    hipEvent_t far[2] = {nullptr, nullptr}; // far column updates of the chunk done
+    hipEvent_t done = nullptr; // all the work of the sweep on s1 done
+
+    rocblas_status init()
+    {
+        if(s1)
+            return rocblas_status_success;
+        HIP_CHECK(hipStreamCreateWithFlags(&s1, hipStreamNonBlocking));
+        for(hipEvent_t* e : {&chased[0], &chased[1], &ubuilt[0], &ubuilt[1], &far[0], &far[1], &done})
+            HIP_CHECK(hipEventCreateWithFlags(e, hipEventDisableTiming));
+        return rocblas_status_success;
+    }
+    ~hseqr_side_stream()
+    {
+        if(!s1)
+            return;
+        (void)hipStreamSynchronize(s1);
+        (void)hipStreamSynchronize(s0);
+        for(hipEvent_t e : {chased[0], chased[1], ubuilt[0], ubuilt[1], far[0], far[1], done})
+            (void)hipEventDestroy(e);
+        (void)hipStreamDestroy(s1);
+    }
+};
+
 /** HSEQR_IPARMQ returns the number of shifts (ISPEC = 15) and the deflation window
     size (ISPEC = 13) recommended by LAPACK IPARMQ for an active block of order nh. **/
 template <typename I>
@@ -472,7 +527,9 @@ I hseqr_multishift(rocblas_handle handle,
     const T one = T(1);
     const T zero = T(0);
 
-    // C (m-by-k) = op(A) * B through the scratch W (ldw), then copied back into C
+    // C (m-by-k) = op(A) * B through the scratch W (ldw), then copied back into C, on the
+    // stream gstream (the stream of the handle must be the same)
+    hipStream_t gstream = stream;
     auto gemm_copy = [&](rocblas_operation transA, const I m, const I nn, const I k, T* A,
                          const I lda, T* B, const I ldb, T* C, const I ldc, T* Ws, const I ldw) {
         if(m <= 0 || nn <= 0)
@@ -482,10 +539,12 @@ I hseqr_multishift(rocblas_handle handle,
         const I blocksx = (m - 1) / BS2 + 1;
         const I blocksy = (nn - 1) / BS2 + 1;
         ROCSOLVER_LAUNCH_KERNEL((copy_mat<T, T*, T*>), dim3(blocksx, blocksy, 1), dim3(BS2, BS2), 0,
-                                stream, m, nn, Ws, 0, ldw, 0, C, 0, ldc, 0);
+                                gstream, m, nn, Ws, 0, ldw, 0, C, 0, ldc, 0);
     };
     auto h = [&](const I i, const I j) -> T* { return H + idx2D(i - 1, j - 1, ldh); };
     auto z = [&](const I i, const I j) -> T* { return Z + idx2D(i - 1, j - 1, ldz); };
+    hseqr_side_stream side;
+    side.s0 = stream;
 
     // tuning parameters (LAPACK IPARMQ and ZLAQR0 3.9.0, with an unlimited LWORK)
     const I nhfull = ihi - ilo + 1;
@@ -734,40 +793,90 @@ I hseqr_multishift(rocblas_handle handle,
             if(ktop + 2 <= kbot)
                 HIP_CHECK(hipMemsetAsync(h(ktop + 2, ktop), 0, sizeof(T), stream));
 
-            for(I incol = 3 * (1 - nbmps) + ktop - 1; incol <= kbot - 2; incol += 3 * nbmps - 2)
+            // With accum, the chunks are pipelined over two streams: on the main stream, the
+            // chunk kernel and the left update of the columns that the next chunk uses
+            // (laqr5_left_apply_kernel); on the side stream, the formation of U and the
+            // matrix-matrix products that update the rest of H and Z, concurrently with the
+            // next chunk (they act on entries that the next chunk kernel does not use). The
+            // reflections of the chunks alternate between two slots of Vbuf.
+            const size_t vslot = size_t(3 * nbmps) * 3 * (nbmps + 1);
+            const I jbot = wantt ? n : kbot;
+            I chunk = 0;
+            if(accum)
             {
+                ROCBLAS_CHECK(side.init());
+                HIP_CHECK(hipEventRecord(side.done, stream));
+                HIP_CHECK(hipStreamWaitEvent(side.s1, side.done, 0));
+            }
+            for(I incol = 3 * (1 - nbmps) + ktop - 1; incol <= kbot - 2;
+                incol += 3 * nbmps - 2, chunk++)
+            {
+                const int slot = chunk % 2;
+                T* Vb = Vbuf + slot * vslot;
+                const I ndcol = incol + kdu;
+
+                // the side stream must be done with this slot of Vbuf (chunk-2)
+                if(accum && chunk >= 2)
+                    HIP_CHECK(hipStreamWaitEvent(stream, side.ubuilt[slot], 0));
                 ROCSOLVER_LAUNCH_KERNEL((laqr5_chunk_kernel<HSEQR_CHASE_BLOCKSIZE, T>), dim3(1),
                                         dim3(HSEQR_CHASE_BLOCKSIZE), 0, stream, wantt, wantz, accum,
                                         n, ktop, kbot, nbmps, incol, W + (ks - 1), H, ldh, iloz,
-                                        ihiz, Z, ldz, U, ldh, Vbuf);
-                if(accum)
+                                        ihiz, Z, ldz, U, ldh, Vb);
+                if(!accum)
+                    continue;
+                HIP_CHECK(hipEventRecord(side.chased[slot], stream));
+
+                // left update of the columns of the next chunk's window (after the far
+                // column updates of the previous chunk, which act on some of them)
+                const I jl0 = std::min(ndcol, kbot) + 1;
+                const I jl1 = std::min(ndcol + 3 * nbmps - 1, jbot);
+                if(chunk >= 1)
+                    HIP_CHECK(hipStreamWaitEvent(stream, side.far[1 - slot], 0));
+                if(jl0 <= jl1)
+                    ROCSOLVER_LAUNCH_KERNEL((laqr5_left_apply_kernel<64, T>), dim3(jl1 - jl0 + 1),
+                                            dim3(64), sizeof(T) * kdu, stream, n, ktop, kbot, nbmps,
+                                            incol, (const T*)Vb, H, ldh, jl0);
+
+                // side stream: form U, then update the far-from-diagonal entries of H and,
+                // if required, Z
+                HIP_CHECK(hipStreamWaitEvent(side.s1, side.chased[slot], 0));
                 {
-                    // form U from the reflections of the chunk, by blocks of rows in shared
-                    // memory (at most 48 KB per thread-block)
+                    // (the handle and gemm_copy use the side stream in this block; the main
+                    // stream is restored however the block is left)
+                    struct stream_restore
+                    {
+                        rocblas_handle handle;
+                        hipStream_t s0;
+                        hipStream_t& gs;
+                        ~stream_restore()
+                        {
+                            rocblas_set_stream(handle, s0);
+                            gs = s0;
+                        }
+                    } restore{handle, stream, gstream};
+                    rocblas_set_stream(handle, side.s1);
+                    gstream = side.s1;
+
                     const I nr = std::max(I(1), std::min(kdu, I(49152 / (sizeof(T) * kdu))));
                     const I nblk = (kdu - 1) / nr + 1;
                     ROCSOLVER_LAUNCH_KERNEL((laqr5_build_u_kernel<256, T>), dim3(nblk), dim3(256),
-                                            sizeof(T) * nr * kdu, stream, ktop, kbot, nbmps, incol,
-                                            (const T*)Vbuf, nr, U, ldh);
-                }
+                                            sizeof(T) * nr * kdu, side.s1, ktop, kbot, nbmps, incol,
+                                            (const T*)Vb, nr, U, ldh);
+                    HIP_CHECK(hipEventRecord(side.ubuilt[slot], side.s1));
 
-                if(accum)
-                {
-                    // use U to update far-from-diagonal entries in H and, if required, Z
                     const I jtop = wantt ? I(1) : ktop;
-                    const I jbot = wantt ? n : kbot;
-                    const I ndcol = incol + kdu;
                     const I k1 = std::max(I(1), ktop - incol);
                     const I nu = (kdu - std::max(I(0), ndcol - kbot)) - k1 + 1;
                     T* Uk = U + idx2D(k1 - 1, k1 - 1, ldh);
 
-                    for(I jcol = std::min(ndcol, kbot) + 1; jcol <= jbot; jcol += nho)
+                    for(I jcol = std::max(jl0, jl1 + 1); jcol <= jbot; jcol += nho)
                     {
                         const I jlen = std::min(nho, jbot - jcol + 1);
                         gemm_copy(rocblas_operation_conjugate_transpose, nu, jlen, nu, Uk, ldh,
                                   h(incol + k1, jcol), ldh, h(incol + k1, jcol), ldh, h(ku, kwh),
                                   ldh);
                     }
+                    HIP_CHECK(hipEventRecord(side.far[slot], side.s1));
                     for(I jrow = jtop; jrow <= std::max(ktop, incol) - 1; jrow += nve)
                     {
                         const I jlen = std::min(nve, std::max(ktop, incol) - jrow);
@@ -784,6 +893,12 @@ I hseqr_multishift(rocblas_handle handle,
                         }
                     }
                 }
+            }
+            if(accum)
+            {
+                // the main stream waits for the side stream at the end of the sweep
+                HIP_CHECK(hipEventRecord(side.done, side.s1));
+                HIP_CHECK(hipStreamWaitEvent(stream, side.done, 0));
             }
         }
 
@@ -808,11 +923,12 @@ void rocsolver_hseqr_getMemorySize(const I n, const I batch_count, size_t* size_
     {
         // (and the flags of the matrices with NaN or infinite entries)
         *size_work = sizeof(I) * (LAQR0_STATUS_SIZE + batch_count);
-        // (and the reflections of one chunk of the sweep, see hseqr_multishift)
+        // (and the reflections of two chunks of the sweep, see hseqr_multishift)
         I nsmax = std::min((n + 6) / 9, I(HSEQR_MAX_SHIFTS));
         nsmax = std::max(I(2), nsmax - nsmax % 2);
         const I nbmps = nsmax / 2;
-        *size_workT = sizeof(T) * (LAQR0_STATUS_SCALAR_SIZE + size_t(3 * nbmps) * 3 * (nbmps + 1));
+        *size_workT
+            = sizeof(T) * (LAQR0_STATUS_SCALAR_SIZE + 2 * size_t(3 * nbmps) * 3 * (nbmps + 1));
     }
 }
 
