@@ -315,6 +315,14 @@
 #define HSEQR_CHASE_BLOCKSIZE 1024
 #endif
 
+/*! \brief Maximum number of thread-blocks that chase the bulges of a chunk of the
+    multishift QR sweeps of HSEQR (when the reflections are accumulated). The
+    multiplications by the reflections are distributed among them, with two grid
+    barriers per step of the chase. At most a quarter of the compute units are used. */
+#ifndef HSEQR_CHASE_GROUPS
+#define HSEQR_CHASE_GROUPS 16
+#endif
+
 /*! \brief Maximum size of the (initial) deflation window of the aggressive early
     deflation in HSEQR, or 0 to use the size recommended by LAPACK IPARMQ.
 

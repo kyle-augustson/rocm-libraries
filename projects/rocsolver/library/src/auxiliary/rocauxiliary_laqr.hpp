@@ -561,6 +561,35 @@ __device__ void hqr_laqr1(const int nn, const T* H, const I ldh, const T s1, con
     }
 }
 
+/** LAQR5_GRID_BARRIER synchronizes the G thread-blocks of a grid (all of them resident),
+    and makes the global memory writes of each one visible to the others. bar points to
+    two counters (arrivals and generation); the arrivals counter must be 0 initially, and
+    it is 0 again after each barrier. **/
+__device__ inline void laqr5_grid_barrier(unsigned* bar, const unsigned G)
+{
+    __syncthreads();
+    if(hipThreadIdx_x == 0)
+    {
+        unsigned* cnt = bar;
+        unsigned* gen = bar + 1;
+        const unsigned g0 = __hip_atomic_load(gen, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence();
+        if(atomicAdd(cnt, 1u) == G - 1)
+        {
+            __hip_atomic_store(cnt, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            __threadfence();
+            atomicAdd(gen, 1u);
+        }
+        else
+        {
+            while(__hip_atomic_load(gen, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == g0)
+                __builtin_amdgcn_s_sleep(1);
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+
 /*
  * ===========================================================================
  *    LAQR5_CHUNK_BLOCK: near-the-diagonal part of one chunk of a small-bulge
@@ -579,6 +608,16 @@ __device__ void hqr_laqr1(const int nn, const T* H, const I ldh, const T s1, con
  *
  *    s contains the shifts (s[0:2*nbmps-1]), and sV is shared workspace for
  *    nbmps+1 reflections.
+ *
+ *    With accum, the chunk may be chased by G > 1 thread-blocks (w = 0:G-1; bar
+ *    are the counters of laqr5_grid_barrier). Thread-block 0 generates the
+ *    reflections of each step (stored in Vbuf, from which the others read them),
+ *    all of them multiply by the reflections from the left, and from the right
+ *    thread-block 0 updates the rows near each bulge (rows k-3:k+3), which contain
+ *    all the entries that the deflation checks, the fill-in of the last rows and
+ *    the reflections of the next step use, while the others update the rows above
+ *    them. Thus there are two grid barriers per step: after the reflections are
+ *    generated, and between the multiplications from the left and from the right.
  * ===========================================================================
  */
 template <int BS, typename T, typename I>
@@ -600,7 +639,10 @@ __device__ void laqr5_chunk_block(const bool wantt,
                                   T* U,
                                   const I ldu,
                                   T* Vbuf,
-                                  T (*sV)[3])
+                                  T (*sV)[3],
+                                  const I G = 1,
+                                  const I w = 0,
+                                  unsigned* bar = nullptr)
 {
     using S = decltype(std::real(T{}));
 
@@ -656,6 +698,10 @@ __device__ void laqr5_chunk_block(const bool wantt,
         }
     };
 
+    // (thread-block 0 leads: it generates the reflections, and does the deflation checks
+    // and the fill-in)
+    const bool lead = (w == 0);
+
     const I krlast = std::min(incol + 3 * nbmps - 3, kbot - 2);
     for(I krcol = incol; krcol <= krlast; krcol++)
     {
@@ -669,7 +715,7 @@ __device__ void laqr5_chunk_block(const bool wantt,
 
         // 1. generate reflections to chase the chain right one column (one thread per
         //    bulge; the bulges read and write disjoint entries of H)
-        for(I m = mtop + tid; m <= mbot; m += BS)
+        for(I m = mtop + tid; lead && m <= mbot; m += BS)
         {
             const I k = krcol + 3 * (m - 1);
             T v3[3];
@@ -742,7 +788,7 @@ __device__ void laqr5_chunk_block(const bool wantt,
         }
 
         // generate a 2-by-2 reflection, if needed
-        if(bmp22 && tid == BS - 1)
+        if(lead && bmp22 && tid == BS - 1)
         {
             const I k = krcol + 3 * (m22 - 1);
             T v2[2];
@@ -770,19 +816,46 @@ __device__ void laqr5_chunk_block(const bool wantt,
         }
         __syncthreads();
 
+        // with accum, store the reflections of this step (U is formed later from them, Z
+        // is updated with a matrix-matrix multiply, and the other thread-blocks read them)
+        const I mlast = mbot + (bmp22 ? 1 : 0);
+        const I nb = mlast - mtop + 1;
+        T* vb = Vbuf + (krcol - incol) * ldvb;
+        if(accum && lead)
+        {
+            for(I idx = tid; idx < 3 * nb; idx += BS)
+            {
+                const I m = mtop + idx / 3;
+                const I r = 1 + idx % 3;
+                vb[3 * (m - 1) + r - 1] = vv(r, m);
+            }
+        }
+        if(G > 1)
+        {
+            laqr5_grid_barrier(bar, G);
+            if(!lead)
+            {
+                for(I idx = tid; idx < 3 * nb; idx += BS)
+                {
+                    const I m = mtop + idx / 3;
+                    const I r = 1 + idx % 3;
+                    vv(r, m) = vb[3 * (m - 1) + r - 1];
+                }
+                __syncthreads();
+            }
+        }
+
         // 2. multiply H by reflections from the left. The bulges act on disjoint rows, so
         //    all the (bulge, column) pairs are independent; they are distributed among the
         //    threads with the bulge index running fastest (the rows k+1:k+3 of consecutive
         //    bulges are contiguous in memory). Bulge m acts on the columns j >= k+1.
         const I jbot = accum ? std::min(ndcol, kbot) : (wantt ? n : kbot);
         {
-            const I mlast = mbot + (bmp22 ? 1 : 0);
-            const I nb = mlast - mtop + 1;
             const I j0 = std::max(ktop, krcol);
             const I ncols = jbot - j0 + 1;
             if(nb > 0 && ncols > 0)
             {
-                for(I idx = tid; idx < nb * ncols; idx += BS)
+                for(I idx = w * BS + tid; idx < nb * ncols; idx += G * BS)
                 {
                     const I m = mtop + idx % nb;
                     const I j = j0 + idx / nb;
@@ -809,7 +882,10 @@ __device__ void laqr5_chunk_block(const bool wantt,
                 }
             }
         }
-        __syncthreads();
+        if(G > 1)
+            laqr5_grid_barrier(bar, G);
+        else
+            __syncthreads();
 
         // 3. multiply H by reflections from the right, and accumulate them in U (or apply
         //    them to Z). Delay filling in the last row until the vigilant deflation check
@@ -817,9 +893,6 @@ __device__ void laqr5_chunk_block(const bool wantt,
         //    are independent and are distributed among the threads.
         const I jtop = accum ? std::max(ktop, incol) : (wantt ? I(1) : ktop);
         {
-            const I mlast = mbot + (bmp22 ? 1 : 0);
-            const I nb = mlast - mtop + 1;
-
             // apply the reflection of bulge m (2-by-2 if m == m22) from the right to the
             // pair or triplet of columns starting at column c of the matrix A
             auto apply_right = [&](const I m, T& a1, T& a2, T& a3) {
@@ -842,8 +915,39 @@ __device__ void laqr5_chunk_block(const bool wantt,
             };
 
             // H: rows jtop:min(kbot,k+3) of each bulge (the range of the last bulge is the
-            // longest; shorter ranges skip the extra rows)
-            if(nb > 0)
+            // longest; shorter ranges skip the extra rows). With G > 1, thread-block 0
+            // updates rows max(jtop,k-3):min(kbot,k+3), and the others rows jtop:k-4.
+            if(nb > 0 && G > 1 && lead)
+            {
+                for(I idx = tid; idx < nb * 7; idx += BS)
+                {
+                    const I m = mtop + idx / 7;
+                    const I k = krcol + 3 * (m - 1);
+                    const I j = k - 3 + idx % 7;
+                    if(vv(1, m) == T(0) || j < jtop || j > std::min(kbot, k + 3))
+                        continue;
+                    T a3dummy = T(0);
+                    T& a3 = (m == m22 && bmp22) ? a3dummy : h(j, k + 3);
+                    apply_right(m, h(j, k + 1), h(j, k + 2), a3);
+                }
+            }
+            else if(nb > 0 && G > 1)
+            {
+                const I kmax = krcol + 3 * (mlast - 1);
+                const I nrows = std::min(kbot, kmax - 4) - jtop + 1;
+                for(I idx = (w - 1) * BS + tid; idx < nb * nrows; idx += (G - 1) * BS)
+                {
+                    const I m = mtop + idx / nrows;
+                    const I j = jtop + idx % nrows;
+                    const I k = krcol + 3 * (m - 1);
+                    if(vv(1, m) == T(0) || j > std::min(kbot, k - 4))
+                        continue;
+                    T a3dummy = T(0);
+                    T& a3 = (m == m22 && bmp22) ? a3dummy : h(j, k + 3);
+                    apply_right(m, h(j, k + 1), h(j, k + 2), a3);
+                }
+            }
+            else if(nb > 0)
             {
                 const I kmax = krcol + 3 * (mlast - 1);
                 const I nrows = std::min(kbot, kmax + 3) - jtop + 1;
@@ -860,19 +964,7 @@ __device__ void laqr5_chunk_block(const bool wantt,
                 }
             }
 
-            if(accum && nb > 0)
-            {
-                // store the reflections of this step (U is formed later from them, and Z
-                // is updated with a matrix-matrix multiply)
-                T* vb = Vbuf + (krcol - incol) * ldvb;
-                for(I idx = tid; idx < 3 * nb; idx += BS)
-                {
-                    const I m = mtop + idx / 3;
-                    const I r = 1 + idx % 3;
-                    vb[3 * (m - 1) + r - 1] = vv(r, m);
-                }
-            }
-            else if(wantz && nb > 0)
+            if(!accum && wantz && nb > 0)
             {
                 // U is not accumulated, so update Z now by multiplying by reflections from
                 // the right
@@ -907,13 +999,13 @@ __device__ void laqr5_chunk_block(const bool wantt,
             if(krcol == kbot - 2)
             {
                 mend = mend + 1;
-                if(tid == 0)
+                if(lead && tid == 0)
                     for(I m = mstart; m <= mend; m++)
                         vigilant(std::min(kbot - 1, krcol + 3 * (m - 1)));
             }
             else
             {
-                for(I m = mstart + tid; m <= mend; m += BS)
+                for(I m = mstart + tid; lead && m <= mend; m += BS)
                     vigilant(std::min(kbot - 1, krcol + 3 * (m - 1)));
             }
         }
@@ -922,7 +1014,7 @@ __device__ void laqr5_chunk_block(const bool wantt,
         // 5. fill in the last row of each bulge
         {
             const I mend = std::min(nbmps, (kbot - krcol - 1) / 3);
-            for(I m = mtop + tid; m <= mend; m += BS)
+            for(I m = mtop + tid; lead && m <= mend; m += BS)
             {
                 const I k = krcol + 3 * (m - 1);
                 T refsum = vv(1, m) * vv(3, m) * h(k + 4, k + 3);
