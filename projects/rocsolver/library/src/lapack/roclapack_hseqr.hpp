@@ -489,6 +489,35 @@ void hseqr_iparmq(const I nh, I& ns, I& nw)
     nw = (nh <= 500) ? ns : 3 * ns / 2;
 }
 
+/** HSEQR_AED_WINDOW_CAP returns the cap of the (initial) deflation window for an active
+    block of order nh: HSEQR_AED_WINDOW_MAX (0: no cap), raised for large blocks. The
+    number of shifts per sweep is capped likewise, and the number of steps of the chase
+    grows as nh^2 / (number of shifts), so that larger windows pay off as nh grows,
+    sooner in hybrid mode, where the Schur form of the window is computed on the host.
+    The thresholds were measured on MI300X (zhseqr of random matrices). **/
+template <typename I>
+I hseqr_aed_window_cap(const I nh, const bool hybrid)
+{
+    I cap = HSEQR_AED_WINDOW_MAX;
+    if(cap <= 0)
+        return 0;
+    if(hybrid)
+    {
+        if(nh >= 7500)
+            cap = std::max(cap, I(96));
+        if(nh >= 15000)
+            cap = std::max(cap, I(128));
+        if(nh >= 30000)
+            cap = std::max(cap, I(192));
+    }
+    else
+    {
+        if(nh >= 15000)
+            cap = std::max(cap, I(96));
+    }
+    return cap;
+}
+
 /** HSEQR_MULTISHIFT computes the Schur form of one Hessenberg matrix with the
     multishift QR algorithm with aggressive early deflation of LAPACK ZLAQR0. The
     control flow runs on the host; each iteration launches one kernel (active block,
@@ -570,15 +599,16 @@ I hseqr_multishift(rocblas_handle handle,
     const I itmax = 30 * std::max(I(10), nhfull);
 
     // deflation window size: the value recommended by IPARMQ, capped by
-    // HSEQR_AED_WINDOW_MAX (see ideal_sizes.hpp). The number of shifts is capped
-    // likewise: with more shifts than the window can provide, every sweep would get
-    // the missing ones from ZLAHQR on an ns-by-ns trailing submatrix (a slow,
-    // sequential step on the device)
+    // hseqr_aed_window_cap (see HSEQR_AED_WINDOW_MAX in ideal_sizes.hpp). The number of
+    // shifts is capped likewise: with more shifts than the window can provide, every
+    // sweep would get the missing ones from ZLAHQR on an ns-by-ns trailing submatrix (a
+    // slow, sequential step on the device)
     I nwr_t = nwr;
     I nsr_t = nsr;
-    if(HSEQR_AED_WINDOW_MAX > 0)
+    const I wcap = hseqr_aed_window_cap(nhfull, hybrid);
+    if(wcap > 0)
     {
-        nwr_t = std::min(nwr_t, I(HSEQR_AED_WINDOW_MAX));
+        nwr_t = std::min(nwr_t, wcap);
         nsr_t = std::min(nsr_t, nwr_t);
         nsr_t = std::max(I(2), nsr_t - nsr_t % 2);
     }

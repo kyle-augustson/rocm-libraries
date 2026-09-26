@@ -324,12 +324,14 @@
 #endif
 
 /*! \brief Maximum size of the (initial) deflation window of the aggressive early
-    deflation in HSEQR, or 0 to use the size recommended by LAPACK IPARMQ.
+    deflation in HSEQR for small and medium matrices, or 0 to use the size recommended
+    by LAPACK IPARMQ.
 
     \details The Schur form of the window is computed by a single thread-block, so
     that large windows are expensive on the GPU. The default was measured on MI300X
     (n = 2000: 5.0 s with the IPARMQ window of 96, 3.5 s with 64); it deviates from
-    LAPACK, which uses windows of NS or 3*NS/2 entries (NS = number of shifts).
+    LAPACK, which uses windows of NS or 3*NS/2 entries (NS = number of shifts). For
+    large matrices the cap is raised (see hseqr_aed_window_cap).
     (The window may still grow beyond this value after several iterations without
     deflations, as in LAPACK.)*/
 #ifndef HSEQR_AED_WINDOW_MAX
