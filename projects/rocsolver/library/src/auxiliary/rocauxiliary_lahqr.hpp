@@ -889,4 +889,424 @@ __host__ __device__ I lahqr_block(const bool wantt,
     return 0;
 }
 
+/*
+ * ===========================================================================
+ *    LAHQR_LDS_BLOCK: ZLAHQR for a small matrix (n <= HQR_LDS_NMAX) with the Schur
+ *    form and Schur vectors (wantt, wantz, ilo = iloz = 1, ihi = ihiz = n), as used
+ *    by the aggressive early deflation. It follows lahqr_block, but:
+ *    - the upper Hessenberg matrix (and the bulge) is kept in shared memory, packed
+ *      by columns (column j holds rows 1:min(j+2,n));
+ *    - the 2-element reflections are computed directly when no scaling is needed;
+ *    - the updates of Z are deferred to the end of each QR sweep, when each thread
+ *      applies the transformations of the sweep to one row of Z.
+ *    The QR iteration is a chain of small dependent steps; these changes shorten the
+ *    latency of each step. All the threads of the block (BS >= HQR_LDS_NMAX) must call
+ *    it. The shared workspace ws must hold HQR_LDS_WS_SIZE entries of type T.
+ * ===========================================================================
+ */
+#define HQR_LDS_NMAX 64
+// packed matrix (2205 entries for n = 64), 2*HQR_LDS_NMAX transformations, and
+// HQR_LDS_NMAX + 2 integers (column offsets and a reduction variable; 40 entries of at
+// least 8 bytes)
+#define HQR_LDS_WS_SIZE (2208 + 2 * HQR_LDS_NMAX + 40)
+
+/** HQR_LARFG2_FAST computes a 2-element reflection like hqr_larfg<2>, directly when
+    alpha and x are in a range where no scaling is needed. **/
+template <typename T>
+__device__ inline T hqr_larfg2_fast(T& alpha, T& x)
+{
+    using S = decltype(std::real(T{}));
+    const S xr = x.real(), xi = x.imag();
+    const S ar = alpha.real(), ai = alpha.imag();
+    const S xn2 = xr * xr + xi * xi;
+    if(xn2 == 0 && ai == 0)
+        return T(0);
+    const S big = std::is_same<S, double>::value ? S(1e100) : S(1e15);
+    const S m = std::max(std::max(std::abs(ar), std::abs(ai)), std::sqrt(xn2));
+    if(!(m < big && m > S(1) / big))
+    {
+        T tau;
+        hqr_larfg<2>(alpha, &x, tau);
+        return tau;
+    }
+    const S beta = -std::copysign(std::sqrt(ar * ar + ai * ai + xn2), ar);
+    const T tau = T((beta - ar) / beta, -ai / beta);
+    // x <- x / (alpha - beta)
+    const S dr = ar - beta;
+    const S rd = S(1) / (dr * dr + ai * ai);
+    x = x * T(dr * rd, -ai * rd);
+    alpha = T(beta);
+    return tau;
+}
+
+template <int BS, typename T, typename I>
+__device__ I lahqr_lds_block(const I n, T* Hg, const I ldh, T* Wg, T* Zg, const I ldz, T* ws)
+{
+    static_assert(BS >= HQR_LDS_NMAX, "lahqr_lds_block needs at least HQR_LDS_NMAX threads");
+    using S = decltype(std::real(T{}));
+    const I tid = hipThreadIdx_x;
+
+    T* Hs = ws;
+    T* rt1 = ws + 2208;
+    T* rv2 = rt1 + HQR_LDS_NMAX;
+    int* offs = reinterpret_cast<int*>(rv2 + HQR_LDS_NMAX);
+    int* s_int = offs + HQR_LDS_NMAX + 1;
+
+    if(tid == 0)
+    {
+        int sz = 0;
+        for(int j = 1; j <= n; j++)
+        {
+            offs[j] = sz - 1; // h(i,j) is Hs[offs[j] + i]
+            sz += std::min(j + 2, int(n));
+        }
+    }
+    __syncthreads();
+    auto h = [&](const I i, const I j) -> T& { return Hs[offs[j] + i]; };
+    auto z = [&](const I i, const I j) -> T& { return Zg[idx2D(i - 1, j - 1, ldz)]; };
+
+    // load the Hessenberg part (the entries two positions below the diagonal are
+    // cleared, as in lahqr_block)
+    for(I j = 1; j <= n; j++)
+        for(I i = 1 + tid; i <= std::min(j + 2, n); i += BS)
+            h(i, j) = (i <= j + 1) ? Hg[idx2D(i - 1, j - 1, ldh)] : T(0);
+    __syncthreads();
+
+    const S rzero = 0;
+    const S half = S(0.5);
+    const S dat1 = S(3) / S(4);
+    const I kexsh = 10;
+    const I ilo = 1, ihi = n, i1 = 1, i2 = n;
+
+    // ensure that subdiagonal entries are real
+    for(I i = ilo + 1; i <= ihi; i++)
+    {
+        T hi = h(i, i - 1);
+        if(hi.imag() != rzero)
+        {
+            T sc = hi / hqr_cabs1(hi);
+            sc = conj(sc) / std::abs(sc);
+            S habs = std::abs(hi);
+            __syncthreads();
+            for(I j = i + tid; j <= i2; j += BS)
+            {
+                T v = sc * h(i, j);
+                if(j == i)
+                    v = conj(sc) * v;
+                h(i, j) = v;
+            }
+            for(I j = i1 + tid; j <= std::min(i2, i + 1); j += BS)
+                if(j != i)
+                    h(j, i) = conj(sc) * h(j, i);
+            for(I j = 1 + tid; j <= n; j += BS)
+                z(j, i) = conj(sc) * z(j, i);
+            __syncthreads();
+            if(tid == 0)
+                h(i, i - 1) = T(habs);
+            __syncthreads();
+        }
+    }
+
+    const I nh = ihi - ilo + 1;
+    const S safmin = hqr_safmin<S>();
+    const S ulp = hqr_ulp<S>();
+    const S smlnum = safmin * (S(nh) / ulp);
+    const I itmax = 30 * std::max(I(10), nh);
+    I kdefl = 0;
+
+    auto negligible = [&](const I k) -> bool {
+        T hk = h(k, k - 1);
+        if(hqr_cabs1(hk) <= smlnum)
+            return true;
+        S tst = hqr_cabs1(h(k - 1, k - 1)) + hqr_cabs1(h(k, k));
+        if(tst == rzero)
+        {
+            if(k - 2 >= ilo)
+                tst = tst + std::abs(h(k - 1, k - 2).real());
+            if(k + 1 <= ihi)
+                tst = tst + std::abs(h(k + 1, k).real());
+        }
+        if(std::abs(hk.real()) <= ulp * tst)
+        {
+            S ab = std::max(hqr_cabs1(hk), hqr_cabs1(h(k - 1, k)));
+            S ba = std::min(hqr_cabs1(hk), hqr_cabs1(h(k - 1, k)));
+            S aa = std::max(hqr_cabs1(h(k, k)), hqr_cabs1(h(k - 1, k - 1) - h(k, k)));
+            S bb = std::min(hqr_cabs1(h(k, k)), hqr_cabs1(h(k - 1, k - 1) - h(k, k)));
+            S s = aa + ab;
+            if(ba * (ab / s) <= std::max(smlnum, ulp * (bb * (aa / s))))
+                return true;
+        }
+        return false;
+    };
+
+    I i = ihi;
+    I result = 0;
+    while(i >= ilo)
+    {
+        I l = ilo;
+        bool converged = false;
+        for(I its = 0; its <= itmax; its++)
+        {
+            // the largest k in l+1:i such that h(k,k-1) is negligible, or l
+            if(tid == 0)
+                *s_int = 0;
+            __syncthreads();
+            {
+                const I k = i - tid;
+                if(tid < HQR_LDS_NMAX && k >= l + 1 && negligible(k))
+                    atomicMax(s_int, int(k));
+            }
+            __syncthreads();
+            const I kfound = *s_int;
+            l = (kfound > 0) ? kfound : l;
+            __syncthreads();
+            if(l > ilo && tid == 0)
+                h(l, l - 1) = T(0);
+            __syncthreads();
+            if(l >= i)
+            {
+                converged = true;
+                break;
+            }
+            kdefl++;
+
+            T t;
+            if(kdefl % (2 * kexsh) == 0)
+            {
+                S s = dat1 * std::abs(h(i, i - 1).real());
+                t = s + h(i, i);
+            }
+            else if(kdefl % kexsh == 0)
+            {
+                S s = dat1 * std::abs(h(l + 1, l).real());
+                t = s + h(l, l);
+            }
+            else
+            {
+                t = h(i, i);
+                T u = hqr_csqrt(h(i - 1, i)) * hqr_csqrt(h(i, i - 1));
+                S s = hqr_cabs1(u);
+                if(s != rzero)
+                {
+                    T x = half * (h(i - 1, i - 1) - t);
+                    S sx = hqr_cabs1(x);
+                    s = std::max(s, hqr_cabs1(x));
+                    T xs = x / s;
+                    T us = u / s;
+                    T y = s * hqr_csqrt(xs * xs + us * us);
+                    if(sx > rzero)
+                    {
+                        T xsx = x / sx;
+                        if(xsx.real() * y.real() + xsx.imag() * y.imag() < rzero)
+                            y = -y;
+                    }
+                    t = t - u * hqr_zladiv(u, x + y);
+                }
+            }
+
+            auto start_vector = [&](const I m, T& v1, S& v2) {
+                T h11s = h(m, m) - t;
+                S h21 = h(m + 1, m).real();
+                S s = hqr_cabs1(h11s) + std::abs(h21);
+                v1 = h11s / s;
+                v2 = h21 / s;
+            };
+            // the largest m in l+1:i-1 where two consecutive small subdiagonal entries are
+            // found, or l
+            if(tid == 0)
+                *s_int = 0;
+            __syncthreads();
+            {
+                const I m = i - 1 - tid;
+                if(tid < HQR_LDS_NMAX && m >= l + 1)
+                {
+                    T h11s;
+                    S h21;
+                    start_vector(m, h11s, h21);
+                    S h10 = h(m, m - 1).real();
+                    if(std::abs(h10) * std::abs(h21) <= ulp
+                           * (hqr_cabs1(h11s) * (hqr_cabs1(h(m, m)) + hqr_cabs1(h(m + 1, m + 1)))))
+                        atomicMax(s_int, int(m));
+                }
+            }
+            __syncthreads();
+            const I m = (*s_int > 0) ? I(*s_int) : l;
+
+            T v0, v1;
+            {
+                S v2r;
+                start_vector(m, v0, v2r);
+                v1 = T(v2r);
+            }
+            __syncthreads();
+
+            // single-shift QR step (the transformations of Z are stored)
+            bool zscale = false;
+            T zsc = T(1);
+            for(I k = m; k <= i - 1; k++)
+            {
+                if(k > m)
+                {
+                    v0 = h(k, k - 1);
+                    v1 = h(k + 1, k - 1);
+                }
+                const T t1 = hqr_larfg2_fast(v0, v1);
+                const T v2 = v1;
+                const S t2 = (t1 * v2).real();
+                if(tid == 0)
+                {
+                    rt1[k - m] = t1;
+                    rv2[k - m] = v2;
+                }
+
+                // rows k and k+1, columns k:i2
+                {
+                    const I j = k + tid;
+                    if(j <= i2)
+                    {
+                        T hk = h(k, j), hk1 = h(k + 1, j);
+                        T sum = conj(t1) * hk + t2 * hk1;
+                        h(k, j) = hk - sum;
+                        h(k + 1, j) = hk1 - sum * v2;
+                    }
+                }
+                __syncthreads();
+                if(k > m && tid == 0)
+                {
+                    h(k, k - 1) = v0;
+                    h(k + 1, k - 1) = T(0);
+                }
+                // columns k and k+1, rows i1:min(k+2,i)
+                {
+                    const I j = i1 + tid;
+                    if(j <= std::min(k + 2, i))
+                    {
+                        T hk = h(j, k), hk1 = h(j, k + 1);
+                        T sum = t1 * hk + t2 * hk1;
+                        h(j, k) = hk - sum;
+                        h(j, k + 1) = hk1 - sum * conj(v2);
+                    }
+                }
+                __syncthreads();
+
+                if(k == m && m > l)
+                {
+                    // extra scaling to keep h(m,m-1) real (see lahqr_block)
+                    T temp = T(1) - t1;
+                    temp = temp / std::abs(temp);
+                    zscale = true;
+                    zsc = conj(temp);
+                    if(tid == 0)
+                    {
+                        h(m + 1, m) = h(m + 1, m) * conj(temp);
+                        if(m + 2 <= i)
+                            h(m + 2, m + 1) = h(m + 2, m + 1) * temp;
+                    }
+                    for(I r = m; r <= i; r++)
+                    {
+                        if(r == m + 1)
+                            continue;
+                        for(I c = r + 1 + tid; c <= i2; c += BS)
+                        {
+                            T val = temp * h(r, c);
+                            if(c >= m && c <= i && c != m + 1)
+                                val = conj(temp) * val;
+                            h(r, c) = val;
+                        }
+                    }
+                    for(I c = m; c <= i; c++)
+                    {
+                        if(c == m + 1)
+                            continue;
+                        for(I r = i1 + tid; r <= c - 1; r += BS)
+                            if(r < m || r > i || r == m + 1)
+                                h(r, c) = conj(temp) * h(r, c);
+                    }
+                    __syncthreads();
+                }
+            }
+
+            // ensure that h(i,i-1) is real
+            T tempf = h(i, i - 1);
+            bool zfix = false;
+            if(tempf.imag() != rzero)
+            {
+                S rtemp = std::abs(tempf);
+                tempf = tempf / rtemp;
+                zfix = true;
+                for(I j = i + 1 + tid; j <= i2; j += BS)
+                    h(i, j) = conj(tempf) * h(i, j);
+                for(I j = i1 + tid; j <= i - 1; j += BS)
+                    h(j, i) = tempf * h(j, i);
+                __syncthreads();
+                if(tid == 0)
+                    h(i, i - 1) = T(rtemp);
+            }
+
+            // deferred update of Z: row tid+1 gets the transformations k = m:i-1, the
+            // scaling of columns m and m+2:i by zsc after the first one (if zscale), and
+            // the scaling of column i by tempf (if zfix). The entries of the row are loaded
+            // PF at a time.
+            {
+                const I r = 1 + tid;
+                if(r <= n)
+                {
+                    constexpr int PF = 8;
+                    T cur = z(r, m);
+                    for(I kb = m; kb <= i - 1; kb += PF)
+                    {
+                        T nb[PF];
+#pragma unroll
+                        for(int q = 0; q < PF; q++)
+                            if(kb + q <= i - 1)
+                                nb[q] = z(r, kb + q + 1);
+#pragma unroll
+                        for(int q = 0; q < PF; q++)
+                        {
+                            const I k = kb + q;
+                            if(k > i - 1)
+                                break;
+                            T nxt = nb[q];
+                            if(zscale && k + 1 >= m + 2)
+                                nxt = zsc * nxt;
+                            const T t1 = rt1[k - m];
+                            const T v2 = rv2[k - m];
+                            const S t2 = (t1 * v2).real();
+                            T sum = t1 * cur + t2 * nxt;
+                            cur = cur - sum;
+                            nxt = nxt - sum * conj(v2);
+                            if(k == m && zscale)
+                                cur = zsc * cur;
+                            z(r, k) = cur;
+                            cur = nxt;
+                        }
+                    }
+                    if(zfix)
+                        cur = tempf * cur;
+                    z(r, i) = cur;
+                }
+            }
+            __syncthreads();
+        }
+
+        if(!converged)
+        {
+            result = i;
+            break;
+        }
+        if(tid == 0)
+            Wg[i - 1] = h(i, i);
+        kdefl = 0;
+        i = l - 1;
+    }
+
+    // store the Schur form (upper Hessenberg part; zero below it)
+    __syncthreads();
+    for(I j = 1; j <= n; j++)
+        for(I ii = 1 + tid; ii <= n; ii += BS)
+            Hg[idx2D(ii - 1, j - 1, ldh)] = (ii <= j + 1) ? h(ii, j) : T(0);
+    __syncthreads();
+    return result;
+}
+
 ROCSOLVER_END_NAMESPACE

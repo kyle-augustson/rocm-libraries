@@ -358,7 +358,8 @@ __host__ __device__ void aed_core_block(const I n,
                                         I (*s_ired)[HQR_RED(BS)],
                                         decltype(std::real(T{})) (*s_sred)[HQR_RED(BS)],
                                         int& ibuf,
-                                        int& sbuf)
+                                        int& sbuf,
+                                        T* lds_ws = nullptr)
 {
     using S = decltype(std::real(T{}));
 
@@ -370,8 +371,21 @@ __host__ __device__ void aed_core_block(const I n,
     const S ulp = hqr_ulp<S>();
     const S smlnum = safmin * (S(n) / ulp);
 
-    const I infqr
-        = lahqr_block<BS>(true, true, jw, I(1), jw, Tw, ldt, Wsh, I(1), jw, V, ldv, s_ired, ibuf);
+    I infqr;
+#if defined(__HIP_DEVICE_COMPILE__)
+    // small windows: Schur form in shared memory (see lahqr_lds_block)
+    if constexpr(BS >= HQR_LDS_NMAX)
+    {
+        if(lds_ws && jw <= HQR_LDS_NMAX)
+            infqr = lahqr_lds_block<BS>(jw, Tw, ldt, Wsh, V, ldv, lds_ws);
+        else
+            infqr = lahqr_block<BS>(true, true, jw, I(1), jw, Tw, ldt, Wsh, I(1), jw, V, ldv,
+                                    s_ired, ibuf);
+    }
+    else
+#endif
+        infqr = lahqr_block<BS>(true, true, jw, I(1), jw, Tw, ldt, Wsh, I(1), jw, V, ldv, s_ired,
+                                ibuf);
     hqr_sync();
 
     // deflation detection loop
@@ -585,6 +599,7 @@ __device__ void laqr5_chunk_block(const bool wantt,
                                   const I ldz,
                                   T* U,
                                   const I ldu,
+                                  T* Vbuf,
                                   T (*sV)[3])
 {
     using S = decltype(std::real(T{}));
@@ -603,13 +618,9 @@ __device__ void laqr5_chunk_block(const bool wantt,
     const I kdu = 6 * nbmps - 3;
     const I ndcol = incol + kdu;
 
-    if(accum)
-    {
-        for(I j = 1; j <= kdu; j++)
-            for(I i = 1 + tid; i <= kdu; i += BS)
-                u(i, j) = (i == j) ? T(1) : T(0);
-    }
-    __syncthreads();
+    // (with accum, the reflections of each step are stored in Vbuf, and U is formed
+    // afterwards by laqr5_build_u_block)
+    const I ldvb = 3 * (nbmps + 1);
 
     // test for a negligible subdiagonal entry h(k+1,k) (Ahues & Tisseur)
     auto vigilant = [&](const I k) {
@@ -759,28 +770,42 @@ __device__ void laqr5_chunk_block(const bool wantt,
         }
         __syncthreads();
 
-        // 2. multiply H by reflections from the left (the bulges act on disjoint rows)
+        // 2. multiply H by reflections from the left. The bulges act on disjoint rows, so
+        //    all the (bulge, column) pairs are independent; they are distributed among the
+        //    threads with the bulge index running fastest (the rows k+1:k+3 of consecutive
+        //    bulges are contiguous in memory). Bulge m acts on the columns j >= k+1.
         const I jbot = accum ? std::min(ndcol, kbot) : (wantt ? n : kbot);
-        for(I j = std::max(ktop, krcol) + tid; j <= jbot; j += BS)
         {
-            const I mend = std::min(mbot, (j - krcol + 2) / 3);
-            for(I m = mtop; m <= mend; m++)
+            const I mlast = mbot + (bmp22 ? 1 : 0);
+            const I nb = mlast - mtop + 1;
+            const I j0 = std::max(ktop, krcol);
+            const I ncols = jbot - j0 + 1;
+            if(nb > 0 && ncols > 0)
             {
-                const I k = krcol + 3 * (m - 1);
-                T refsum = conj(vv(1, m))
-                    * (h(k + 1, j) + conj(vv(2, m)) * h(k + 2, j) + conj(vv(3, m)) * h(k + 3, j));
-                h(k + 1, j) = h(k + 1, j) - refsum;
-                h(k + 2, j) = h(k + 2, j) - refsum * vv(2, m);
-                h(k + 3, j) = h(k + 3, j) - refsum * vv(3, m);
-            }
-            if(bmp22)
-            {
-                const I k = krcol + 3 * (m22 - 1);
-                if(j >= std::max(k + 1, ktop))
+                for(I idx = tid; idx < nb * ncols; idx += BS)
                 {
-                    T refsum = conj(vv(1, m22)) * (h(k + 1, j) + conj(vv(2, m22)) * h(k + 2, j));
-                    h(k + 1, j) = h(k + 1, j) - refsum;
-                    h(k + 2, j) = h(k + 2, j) - refsum * vv(2, m22);
+                    const I m = mtop + idx % nb;
+                    const I j = j0 + idx / nb;
+                    const I k = krcol + 3 * (m - 1);
+                    if(bmp22 && m == m22)
+                    {
+                        if(j >= std::max(k + 1, ktop))
+                        {
+                            T refsum
+                                = conj(vv(1, m22)) * (h(k + 1, j) + conj(vv(2, m22)) * h(k + 2, j));
+                            h(k + 1, j) = h(k + 1, j) - refsum;
+                            h(k + 2, j) = h(k + 2, j) - refsum * vv(2, m22);
+                        }
+                    }
+                    else if(j >= k + 1)
+                    {
+                        T refsum = conj(vv(1, m))
+                            * (h(k + 1, j) + conj(vv(2, m)) * h(k + 2, j)
+                               + conj(vv(3, m)) * h(k + 3, j));
+                        h(k + 1, j) = h(k + 1, j) - refsum;
+                        h(k + 2, j) = h(k + 2, j) - refsum * vv(2, m);
+                        h(k + 3, j) = h(k + 3, j) - refsum * vv(3, m);
+                    }
                 }
             }
         }
@@ -837,20 +862,14 @@ __device__ void laqr5_chunk_block(const bool wantt,
 
             if(accum && nb > 0)
             {
-                // accumulate U (if necessary, Z is updated later with a matrix-matrix
-                // multiply)
-                const I j0 = std::max(I(1), ktop - incol);
-                const I nrows = kdu - j0 + 1;
-                for(I idx = tid; idx < nb * nrows; idx += BS)
+                // store the reflections of this step (U is formed later from them, and Z
+                // is updated with a matrix-matrix multiply)
+                T* vb = Vbuf + (krcol - incol) * ldvb;
+                for(I idx = tid; idx < 3 * nb; idx += BS)
                 {
-                    const I m = mtop + idx / nrows;
-                    const I j = j0 + idx % nrows;
-                    if(vv(1, m) == T(0))
-                        continue;
-                    const I kms = krcol + 3 * (m - 1) - incol;
-                    T a3dummy = T(0);
-                    T& a3 = (m == m22 && bmp22) ? a3dummy : u(j, kms + 3);
-                    apply_right(m, u(j, kms + 1), u(j, kms + 2), a3);
+                    const I m = mtop + idx / 3;
+                    const I r = 1 + idx % 3;
+                    vb[3 * (m - 1) + r - 1] = vv(r, m);
                 }
             }
             else if(wantz && nb > 0)
@@ -913,6 +932,85 @@ __device__ void laqr5_chunk_block(const bool wantt,
             }
         }
         __syncthreads();
+    }
+}
+
+/** LAQR5_BUILD_U_BLOCK forms rows r0:r0+nr-1 of the kdu-by-kdu matrix U of one chunk
+    of the sweep (laqr5_chunk_block with accum), the product of the reflections stored in
+    Vbuf, with the rows in shared memory (tile, nr-by-kdu with leading dimension nr).
+    Within a step the reflections act on disjoint columns; one barrier per step. **/
+template <int BS, typename T, typename I>
+__device__ void laqr5_build_u_block(const I ktop,
+                                    const I kbot,
+                                    const I nbmps,
+                                    const I incol,
+                                    const T* Vbuf,
+                                    const I r0,
+                                    const I nr,
+                                    T* tile,
+                                    T* U,
+                                    const I ldu)
+{
+    const I tid = hipThreadIdx_x;
+    const I kdu = 6 * nbmps - 3;
+    const I ldvb = 3 * (nbmps + 1);
+    const I j0 = std::max(I(1), ktop - incol);
+    auto t = [&](const I i, const I j) -> T& { return tile[(i - r0) + (j - 1) * nr]; };
+
+    for(I e = tid; e < nr * kdu; e += BS)
+    {
+        const I i = r0 + e % nr;
+        const I j = 1 + e / nr;
+        t(i, j) = (i == j) ? T(1) : T(0);
+    }
+    __syncthreads();
+
+    const I krlast = std::min(incol + 3 * nbmps - 3, kbot - 2);
+    for(I krcol = incol; krcol <= krlast; krcol++)
+    {
+        const I mtop = std::max(I(1), ((ktop - 1) - krcol + 2) / 3 + 1);
+        const I mbot = std::min(nbmps, (kbot - krcol) / 3);
+        const I m22 = mbot + 1;
+        const bool bmp22 = (mbot < nbmps) && (krcol + 3 * (m22 - 1) == kbot - 2);
+        const I mlast = mbot + (bmp22 ? 1 : 0);
+        const I nb = mlast - mtop + 1;
+        const T* vb = Vbuf + (krcol - incol) * ldvb;
+        for(I idx = tid; idx < nb * nr; idx += BS)
+        {
+            const I i = r0 + idx % nr;
+            const I m = mtop + idx / nr;
+            if(i < j0)
+                continue;
+            const T v1 = vb[3 * (m - 1)];
+            if(v1 == T(0))
+                continue;
+            const T v2 = vb[3 * (m - 1) + 1];
+            const I kms = krcol + 3 * (m - 1) - incol;
+            if(m == m22 && bmp22)
+            {
+                T a1 = t(i, kms + 1), a2 = t(i, kms + 2);
+                T refsum = v1 * (a1 + v2 * a2);
+                t(i, kms + 1) = a1 - refsum;
+                t(i, kms + 2) = a2 - refsum * conj(v2);
+            }
+            else
+            {
+                const T v3 = vb[3 * (m - 1) + 2];
+                T a1 = t(i, kms + 1), a2 = t(i, kms + 2), a3 = t(i, kms + 3);
+                T refsum = v1 * (a1 + v2 * a2 + v3 * a3);
+                t(i, kms + 1) = a1 - refsum;
+                t(i, kms + 2) = a2 - refsum * conj(v2);
+                t(i, kms + 3) = a3 - refsum * conj(v3);
+            }
+        }
+        __syncthreads();
+    }
+
+    for(I e = tid; e < nr * kdu; e += BS)
+    {
+        const I i = r0 + e % nr;
+        const I j = 1 + e / nr;
+        U[(i - 1) + (j - 1) * ldu] = t(i, j);
     }
 }
 
@@ -1332,6 +1430,8 @@ __device__ void laqr0_iteration_block(const I n,
     using S = decltype(std::real(T{}));
     __shared__ I s_ired[2][HQR_RED(BS)];
     __shared__ S s_sred[2][HQR_RED(BS)];
+    // shared workspace of the Schur form of small deflation windows
+    __shared__ T lds_ws[HQR_LDS_WS_SIZE];
     int ibuf = 0, sbuf = 0;
 
     const I tid = hqr_tid();
@@ -1354,7 +1454,7 @@ __device__ void laqr0_iteration_block(const I n,
         T spike;
         __syncthreads();
         aed_core_block<BS>(n, jw, s, &h(kv, kt), ldh, &h(kv, 1), ldh, &h(kwv, 1), W + (kwtop - 1),
-                           ns, nd, update, spike, s_ired, s_sred, ibuf, sbuf);
+                           ns, nd, update, spike, s_ired, s_sred, ibuf, sbuf, lds_ws);
         if(tid == 0)
         {
             status[LAQR0_LS] = ns;

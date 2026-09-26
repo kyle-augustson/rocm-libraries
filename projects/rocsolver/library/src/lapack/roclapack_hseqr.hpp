@@ -383,11 +383,32 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) laqr5_chunk_kernel(const bool wantt,
                                                                T* Z,
                                                                const I ldz,
                                                                T* U,
-                                                               const I ldu)
+                                                               const I ldu,
+                                                               T* Vbuf)
 {
     __shared__ T sV[HSEQR_MAX_SHIFTS / 2 + 2][3];
     laqr5_chunk_block<BS>(wantt, wantz, accum, n, ktop, kbot, nbmps, incol, sh, H, ldh, iloz, ihiz,
-                          Z, ldz, U, ldu, sV);
+                          Z, ldz, U, ldu, Vbuf, sV);
+}
+
+/** LAQR5_BUILD_U_KERNEL forms U from the stored reflections (laqr5_build_u_block), each
+    thread-block computing HSEQR_BUILD_U_ROWS(kdu) rows. **/
+template <int BS, typename T, typename I>
+ROCSOLVER_KERNEL void __launch_bounds__(BS) laqr5_build_u_kernel(const I ktop,
+                                                                 const I kbot,
+                                                                 const I nbmps,
+                                                                 const I incol,
+                                                                 const T* Vbuf,
+                                                                 const I nr,
+                                                                 T* U,
+                                                                 const I ldu)
+{
+    extern __shared__ double lmem[];
+    const I kdu = 6 * nbmps - 3;
+    const I r0 = 1 + hipBlockIdx_x * nr;
+    const I nrb = std::min(nr, kdu - r0 + 1);
+    laqr5_build_u_block<BS>(ktop, kbot, nbmps, incol, Vbuf, r0, nrb, reinterpret_cast<T*>(lmem), U,
+                            ldu);
 }
 
 /** HSEQR_IPARMQ returns the number of shifts (ISPEC = 15) and the deflation window
@@ -707,6 +728,7 @@ I hseqr_multishift(rocblas_handle handle,
             const I kwv = kdu + 4;
             const I nve = n - kdu - kwv + 1;
             T* U = h(ku, 1);
+            T* Vbuf = dstatusT + LAQR0_STATUS_SCALAR_SIZE;
 
             // clear trash
             if(ktop + 2 <= kbot)
@@ -717,7 +739,17 @@ I hseqr_multishift(rocblas_handle handle,
                 ROCSOLVER_LAUNCH_KERNEL((laqr5_chunk_kernel<HSEQR_CHASE_BLOCKSIZE, T>), dim3(1),
                                         dim3(HSEQR_CHASE_BLOCKSIZE), 0, stream, wantt, wantz, accum,
                                         n, ktop, kbot, nbmps, incol, W + (ks - 1), H, ldh, iloz,
-                                        ihiz, Z, ldz, U, ldh);
+                                        ihiz, Z, ldz, U, ldh, Vbuf);
+                if(accum)
+                {
+                    // form U from the reflections of the chunk, by blocks of rows in shared
+                    // memory (at most 48 KB per thread-block)
+                    const I nr = std::max(I(1), std::min(kdu, I(49152 / (sizeof(T) * kdu))));
+                    const I nblk = (kdu - 1) / nr + 1;
+                    ROCSOLVER_LAUNCH_KERNEL((laqr5_build_u_kernel<256, T>), dim3(nblk), dim3(256),
+                                            sizeof(T) * nr * kdu, stream, ktop, kbot, nbmps, incol,
+                                            (const T*)Vbuf, nr, U, ldh);
+                }
 
                 if(accum)
                 {
@@ -776,7 +808,11 @@ void rocsolver_hseqr_getMemorySize(const I n, const I batch_count, size_t* size_
     {
         // (and the flags of the matrices with NaN or infinite entries)
         *size_work = sizeof(I) * (LAQR0_STATUS_SIZE + batch_count);
-        *size_workT = sizeof(T) * LAQR0_STATUS_SCALAR_SIZE;
+        // (and the reflections of one chunk of the sweep, see hseqr_multishift)
+        I nsmax = std::min((n + 6) / 9, I(HSEQR_MAX_SHIFTS));
+        nsmax = std::max(I(2), nsmax - nsmax % 2);
+        const I nbmps = nsmax / 2;
+        *size_workT = sizeof(T) * (LAQR0_STATUS_SCALAR_SIZE + size_t(3 * nbmps) * 3 * (nbmps + 1));
     }
 }
 
