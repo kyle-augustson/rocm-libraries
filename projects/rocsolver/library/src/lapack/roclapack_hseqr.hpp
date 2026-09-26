@@ -933,7 +933,7 @@ void rocsolver_hseqr_getMemorySize(const I n, const I batch_count, size_t* size_
     {
         // (and the flags of the matrices with NaN or infinite entries, and the counters of
         // the grid barriers of the sweep)
-        *size_work = sizeof(I) * (LAQR0_STATUS_SIZE + batch_count + 2);
+        *size_work = sizeof(I) * (LAQR0_STATUS_SIZE + batch_count + 4);
         // (and the reflections of two chunks of the sweep, see hseqr_multishift)
         I nsmax = std::min((n + 6) / 9, I(HSEQR_MAX_SHIFTS));
         nsmax = std::max(I(2), nsmax - nsmax % 2);
@@ -1045,7 +1045,7 @@ rocblas_status rocsolver_hseqr_template(rocblas_handle handle,
     // iterated on
     I* dflag = work + LAQR0_STATUS_SIZE;
     unsigned* dbar = reinterpret_cast<unsigned*>(dflag + batch_count);
-    HIP_CHECK(hipMemsetAsync(dbar, 0, 2 * sizeof(unsigned), stream));
+    HIP_CHECK(hipMemsetAsync(dbar, 0, 4 * sizeof(unsigned), stream));
     ROCSOLVER_LAUNCH_KERNEL((hseqr_check_kernel<HSEQR_BLOCKSIZE, T>), dim3(batch_count),
                             dim3(HSEQR_BLOCKSIZE), 0, stream, n, ilo, ihi, H, shiftH, ldh, strideH,
                             W, strideW, dflag);

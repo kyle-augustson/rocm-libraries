@@ -564,8 +564,9 @@ __device__ void hqr_laqr1(const int nn, const T* H, const I ldh, const T s1, con
 /** LAQR5_GRID_BARRIER synchronizes the G thread-blocks of a grid (all of them resident),
     and makes the global memory writes of each one visible to the others. bar points to
     two counters (arrivals and generation); the arrivals counter must be 0 initially, and
-    it is 0 again after each barrier. **/
-__device__ inline void laqr5_grid_barrier(unsigned* bar, const unsigned G)
+    it is 0 again after each barrier. With wait = false, the thread-block only arrives
+    (its writes are visible to the others when they leave the barrier), and goes on. **/
+__device__ inline void laqr5_grid_barrier(unsigned* bar, const unsigned G, const bool wait = true)
 {
     __syncthreads();
     if(hipThreadIdx_x == 0)
@@ -580,12 +581,13 @@ __device__ inline void laqr5_grid_barrier(unsigned* bar, const unsigned G)
             __threadfence();
             atomicAdd(gen, 1u);
         }
-        else
+        else if(wait)
         {
             while(__hip_atomic_load(gen, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == g0)
                 __builtin_amdgcn_s_sleep(1);
         }
-        __threadfence();
+        if(wait)
+            __threadfence();
     }
     __syncthreads();
 }
@@ -610,14 +612,16 @@ __device__ inline void laqr5_grid_barrier(unsigned* bar, const unsigned G)
  *    nbmps+1 reflections.
  *
  *    With accum, the chunk may be chased by G > 1 thread-blocks (w = 0:G-1; bar
- *    are the counters of laqr5_grid_barrier). Thread-block 0 generates the
+ *    are the counters of two laqr5_grid_barrier). Thread-block 0 generates the
  *    reflections of each step (stored in Vbuf, from which the others read them),
- *    all of them multiply by the reflections from the left, and from the right
- *    thread-block 0 updates the rows near each bulge (rows k-3:k+3), which contain
- *    all the entries that the deflation checks, the fill-in of the last rows and
- *    the reflections of the next step use, while the others update the rows above
- *    them. Thus there are two grid barriers per step: after the reflections are
- *    generated, and between the multiplications from the left and from the right.
+ *    multiplies the columns k+1:k+6 of each bulge by them from the left, and the
+ *    rows k:k+3 from the right: these contain all the entries that the deflation
+ *    checks, the fill-in of the last rows and the reflections of the next step use,
+ *    and they depend on no other part of the multiplications. The others multiply
+ *    the columns to the right from the left, then the rows above from the right.
+ *    Thus there are two grid barriers per step: after the reflections are generated,
+ *    and between the multiplications from the left and from the right, where
+ *    thread-block 0 does not wait.
  * ===========================================================================
  */
 template <int BS, typename T, typename I>
@@ -853,37 +857,61 @@ __device__ void laqr5_chunk_block(const bool wantt,
         {
             const I j0 = std::max(ktop, krcol);
             const I ncols = jbot - j0 + 1;
-            if(nb > 0 && ncols > 0)
+            // apply the reflection of bulge m from the left to column j
+            auto apply_left = [&](const I m, const I j) {
+                const I k = krcol + 3 * (m - 1);
+                if(bmp22 && m == m22)
+                {
+                    if(j >= std::max(k + 1, ktop))
+                    {
+                        T refsum = conj(vv(1, m22)) * (h(k + 1, j) + conj(vv(2, m22)) * h(k + 2, j));
+                        h(k + 1, j) = h(k + 1, j) - refsum;
+                        h(k + 2, j) = h(k + 2, j) - refsum * vv(2, m22);
+                    }
+                }
+                else if(j >= k + 1)
+                {
+                    T refsum = conj(vv(1, m))
+                        * (h(k + 1, j) + conj(vv(2, m)) * h(k + 2, j) + conj(vv(3, m)) * h(k + 3, j));
+                    h(k + 1, j) = h(k + 1, j) - refsum;
+                    h(k + 2, j) = h(k + 2, j) - refsum * vv(2, m);
+                    h(k + 3, j) = h(k + 3, j) - refsum * vv(3, m);
+                }
+            };
+
+            // (with G > 1, thread-block 0 updates the columns k+1:k+6 of each bulge, and
+            // the others the columns to their right)
+            if(nb > 0 && ncols > 0 && G == 1)
             {
-                for(I idx = w * BS + tid; idx < nb * ncols; idx += G * BS)
+                for(I idx = tid; idx < nb * ncols; idx += BS)
+                    apply_left(mtop + idx % nb, j0 + idx / nb);
+            }
+            else if(nb > 0 && ncols > 0 && lead)
+            {
+                for(I idx = tid; idx < nb * 6; idx += BS)
+                {
+                    const I m = mtop + idx % nb;
+                    const I j = krcol + 3 * (m - 1) + 1 + idx / nb;
+                    if(j >= j0 && j <= jbot)
+                        apply_left(m, j);
+                }
+            }
+            else if(nb > 0 && ncols > 0)
+            {
+                for(I idx = (w - 1) * BS + tid; idx < nb * ncols; idx += (G - 1) * BS)
                 {
                     const I m = mtop + idx % nb;
                     const I j = j0 + idx / nb;
-                    const I k = krcol + 3 * (m - 1);
-                    if(bmp22 && m == m22)
-                    {
-                        if(j >= std::max(k + 1, ktop))
-                        {
-                            T refsum
-                                = conj(vv(1, m22)) * (h(k + 1, j) + conj(vv(2, m22)) * h(k + 2, j));
-                            h(k + 1, j) = h(k + 1, j) - refsum;
-                            h(k + 2, j) = h(k + 2, j) - refsum * vv(2, m22);
-                        }
-                    }
-                    else if(j >= k + 1)
-                    {
-                        T refsum = conj(vv(1, m))
-                            * (h(k + 1, j) + conj(vv(2, m)) * h(k + 2, j)
-                               + conj(vv(3, m)) * h(k + 3, j));
-                        h(k + 1, j) = h(k + 1, j) - refsum;
-                        h(k + 2, j) = h(k + 2, j) - refsum * vv(2, m);
-                        h(k + 3, j) = h(k + 3, j) - refsum * vv(3, m);
-                    }
+                    if(j >= krcol + 3 * (m - 1) + 7)
+                        apply_left(m, j);
                 }
             }
         }
+
+        // (thread-block 0 needs no entry updated by the others until the next step, so it
+        // does not wait here)
         if(G > 1)
-            laqr5_grid_barrier(bar, G);
+            laqr5_grid_barrier(bar + 2, G, !lead);
         else
             __syncthreads();
 
@@ -916,14 +944,14 @@ __device__ void laqr5_chunk_block(const bool wantt,
 
             // H: rows jtop:min(kbot,k+3) of each bulge (the range of the last bulge is the
             // longest; shorter ranges skip the extra rows). With G > 1, thread-block 0
-            // updates rows max(jtop,k-3):min(kbot,k+3), and the others rows jtop:k-4.
+            // updates rows max(jtop,k):min(kbot,k+3), and the others rows jtop:k-1.
             if(nb > 0 && G > 1 && lead)
             {
-                for(I idx = tid; idx < nb * 7; idx += BS)
+                for(I idx = tid; idx < nb * 4; idx += BS)
                 {
-                    const I m = mtop + idx / 7;
+                    const I m = mtop + idx / 4;
                     const I k = krcol + 3 * (m - 1);
-                    const I j = k - 3 + idx % 7;
+                    const I j = k + idx % 4;
                     if(vv(1, m) == T(0) || j < jtop || j > std::min(kbot, k + 3))
                         continue;
                     T a3dummy = T(0);
@@ -934,13 +962,13 @@ __device__ void laqr5_chunk_block(const bool wantt,
             else if(nb > 0 && G > 1)
             {
                 const I kmax = krcol + 3 * (mlast - 1);
-                const I nrows = std::min(kbot, kmax - 4) - jtop + 1;
+                const I nrows = std::min(kbot, kmax - 1) - jtop + 1;
                 for(I idx = (w - 1) * BS + tid; idx < nb * nrows; idx += (G - 1) * BS)
                 {
                     const I m = mtop + idx / nrows;
                     const I j = jtop + idx % nrows;
                     const I k = krcol + 3 * (m - 1);
-                    if(vv(1, m) == T(0) || j > std::min(kbot, k - 4))
+                    if(vv(1, m) == T(0) || j > std::min(kbot, k - 1))
                         continue;
                     T a3dummy = T(0);
                     T& a3 = (m == m22 && bmp22) ? a3dummy : h(j, k + 3);
