@@ -322,9 +322,11 @@
     \details Below it, each matrix is balanced by a single thread-block. From it, the
     counts of the permutation step and the norms of the scaling step are computed by many
     thread-blocks: the scaling step visits the rows and columns in batches of
-    GEBAL_BATCH, whose decisions are taken in order by one thread-block (so that they are
+    GEBAL_BATCH, whose decisions are taken in order by one wavefront (so that they are
     those of LAPACK), from the norms of the parts of the rows and columns outside the
-    batch, computed beforehand in GEBAL_NSEG segments.*/
+    batch, computed beforehand in GEBAL_NSEG segments. GEBAL_BATCH must not exceed 32.
+    (On gfx1150, for a single matrix, the multi-block path is about as fast as the
+    single-block kernel from n = 96 to 224, and faster from n = 256.)*/
 #ifndef GEBAL_MULTI_MIN
 #define GEBAL_MULTI_MIN 256
 #endif

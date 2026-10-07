@@ -79,6 +79,22 @@ __device__ inline S gebal_sqabs(const T a)
     return a.real() * a.real() + a.imag() * a.imag();
 }
 
+/** GEBAL_MOD returns |a|. As LAPACK (ABS), it returns Inf when a part of a is infinite, even
+    if the other part is infinite or NaN. **/
+template <typename S, typename T, std::enable_if_t<!rocblas_is_complex<T>, int> = 0>
+__device__ inline S gebal_mod(const T a)
+{
+    return std::abs(a);
+}
+
+template <typename S, typename T, std::enable_if_t<rocblas_is_complex<T>, int> = 0>
+__device__ inline S gebal_mod(const T a)
+{
+    if(std::isinf(a.real()) || std::isinf(a.imag()))
+        return std::numeric_limits<S>::infinity();
+    return std::abs(a);
+}
+
 /** GEBAL_VEC_INFO accumulates, in a single pass over a row or column, the data
     needed by the balancing step:
     - the position of the first entry of largest |Re|+|Im| (as returned by I_AMAX)
@@ -124,7 +140,7 @@ struct gebal_vec_info
         {
             amax = v;
             iamax = pos;
-            mod = std::abs(a);
+            mod = gebal_mod<S>(a);
         }
         // (a NaN in the norm range makes the norm NaN, as in LAPACK, so that the
         // balancing stops)
@@ -191,6 +207,18 @@ struct gebal_scaled_ssq
         }
         else if(std::isnan(v))
             ssq = v;
+    }
+
+    // starts from the plain sum of squares s of entries in [safe_lo, safe_hi] (see
+    // gebal_vec_info), which cannot overflow or lose accuracy by underflow
+    __device__ void init_plain(const S s)
+    {
+        init();
+        if(s != 0)
+        {
+            e = 0;
+            ssq = s;
+        }
     }
 
     __device__ void combine(const int e2, const S ssq2)
@@ -734,7 +762,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) gebal_kernel(const rocsolver_balance
  *      its columns and rows outside the diagonal block of the batch (with many
  *      thread-blocks, in GEBAL_NSEG segments); these parts do not change while the batch
  *      is processed. gebal_mb_decide_kernel then takes the decisions in order, as in
- *      LAPACK, on one thread-block per matrix, adding the entries of the diagonal block
+ *      LAPACK, on one wavefront per matrix, adding the entries of the diagonal block
  *      (kept in shared memory and scaled as the decisions are taken), and
  *      gebal_mb_apply_kernel scales the parts outside the block. Each sweep is
  *      followed by a synchronization with the host, which starts another sweep while a
@@ -743,7 +771,8 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) gebal_kernel(const rocsolver_balance
  */
 
 /** GEBAL_PART holds the partial results of gebal_mb_stats_kernel for one column or row
-    of the batch and one segment (see gebal_vec_info and gebal_scaled_ssq). **/
+    of the batch and one segment (see gebal_vec_info and gebal_scaled_ssq; when no entry
+    is too large or too small, the scaled sum is the plain sum with exponent 0). **/
 template <typename S, typename I>
 struct gebal_part
 {
@@ -996,20 +1025,26 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) gebal_mb_stats_kernel(const I n,
         for(int jj = wave; jj < nb; jj += nwaves)
         {
             gebal_vec_info<S, I> v;
-            gebal_scaled_ssq<S> sc;
             v.init(n);
-            sc.init();
             for(I r = r0 + lane; r < r1; r += warpSize)
             {
                 if(r >= ib0 && r <= ib1)
                     continue;
-                const T a = A[idx2D(r, ib0 + jj, lda)];
-                v.add(a, r, r >= k);
-                if(r >= k)
-                    sc.add(a);
+                v.add(A[idx2D(r, ib0 + jj, lda)], r, r >= k);
             }
             v.wave_reduce();
-            sc.wave_reduce();
+
+            // (second pass with scaling only if some entries are too large or too small)
+            gebal_scaled_ssq<S> sc;
+            sc.init_plain(v.ssq);
+            if(v.unsafe)
+            {
+                sc.init();
+                for(I r = std::max(r0, k) + lane; r < r1; r += warpSize)
+                    if(r < ib0 || r > ib1)
+                        sc.add(A[idx2D(r, ib0 + jj, lda)]);
+                sc.wave_reduce();
+            }
             if(lane == 0)
                 rec[jj * NSEG + p] = {v.amax, v.mod, v.ssq, sc.ssq, v.iamax, v.unsafe, sc.e};
         }
@@ -1024,19 +1059,25 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) gebal_mb_stats_kernel(const I n,
         const I c0 = k + I(p * len / NSEG);
         const I c1 = k + I((p + 1) * len / NSEG);
         gebal_vec_info<S, I> v;
-        gebal_scaled_ssq<S> sc;
         v.init(n);
-        sc.init();
         if(r < nb)
             for(I c = c0 + cl; c < c1; c += NCL)
             {
                 if(c >= ib0 && c <= ib1)
                     continue;
-                const T a = A[idx2D(ib0 + r, c, lda)];
-                v.add(a, c, c <= l);
-                if(c <= l)
-                    sc.add(a);
+                v.add(A[idx2D(ib0 + r, c, lda)], c, c <= l);
             }
+
+        // (second pass with scaling, by the threads that found entries too large or too small)
+        gebal_scaled_ssq<S> sc;
+        sc.init_plain(v.ssq);
+        if(v.unsafe)
+        {
+            sc.init();
+            for(I c = c0 + cl; c < c1 && c <= l; c += NCL)
+                if(c < ib0 || c > ib1)
+                    sc.add(A[idx2D(ib0 + r, c, lda)]);
+        }
         __shared__ gebal_part<S, I> sp[BS];
         sp[tid] = {v.amax, v.mod, v.ssq, sc.ssq, v.iamax, v.unsafe, sc.e};
         __syncthreads();
@@ -1053,12 +1094,12 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) gebal_mb_stats_kernel(const I n,
     }
 }
 
-/** GEBAL_MB_DECIDE_KERNEL takes the decisions of the batch ib0:ib1 in order (one
-    thread-block per matrix), as gebal_kernel does: the norms and maxima of each column and
-    row are those of its part outside the diagonal block of the batch (reduced from the
-    partial results in a fixed order) combined with its entries in the block, which is kept
-    in shared memory and scaled as the decisions are taken, and then written back. The
-    factors are left in fac for gebal_mb_apply_kernel. **/
+/** GEBAL_MB_DECIDE_KERNEL takes the decisions of the batch ib0:ib1 in order (on the first
+    wavefront of one thread-block per matrix), as gebal_kernel does: the norms and maxima of
+    each column and row are those of its part outside the diagonal block of the batch
+    (reduced from the partial results in a fixed order) combined with its entries in the
+    block, which is kept in shared memory and scaled as the decisions are taken, and then
+    written back. The factors are left in fac for gebal_mb_apply_kernel. **/
 template <int BS, typename T, typename I, typename S, typename U>
 ROCSOLVER_KERNEL void __launch_bounds__(BS) gebal_mb_decide_kernel(const I n,
                                                                    U AA,
@@ -1113,39 +1154,58 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) gebal_mb_decide_kernel(const I n,
         }
         red[part][jj] = {v.amax, v.mod, v.ssq, sc.ssq, v.iamax, v.unsafe, sc.e};
     }
+    if(tid < BW)
+        fac[tid] = S(1);
     __syncthreads();
 
-    if(tid == 0)
+    // The decisions are taken in order by the first wavefront: lane q holds the entries
+    // (q, jj) and (jj, q) of the block, so that the contribution of the block to column
+    // and row jj is a reduction across the wavefront (GEBAL_BATCH <= warpSize).
+    static_assert(BW <= 32, "GEBAL_BATCH must not exceed the wavefront size");
+    if(tid < warpSize)
     {
+        const int q = tid;
         bool any = false, nan = false;
-        for(int jj = 0; jj < BW; jj++)
-            fac[jj] = S(1);
         for(int jj = 0; jj < nb; jj++)
         {
             const I i = ib0 + jj;
+            const gebal_part<S, I>& rc = red[0][jj];
+            const gebal_part<S, I>& rr = red[1][jj];
+            T a = 0, b = 0;
             gebal_vec_info<S, I> col, row;
-            gebal_scaled_ssq<S> cs, rs;
             col.init(n);
             row.init(n);
-            cs.init();
-            rs.init();
-            col.combine(red[0][jj].amax, red[0][jj].iamax, red[0][jj].mod, red[0][jj].ssq,
-                        red[0][jj].unsafe);
-            cs.combine(red[0][jj].se, red[0][jj].sssq);
-            row.combine(red[1][jj].amax, red[1][jj].iamax, red[1][jj].mod, red[1][jj].ssq,
-                        red[1][jj].unsafe);
-            rs.combine(red[1][jj].se, red[1][jj].sssq);
-            for(int q = 0; q < nb; q++)
+            if(q < nb)
             {
-                const T a = blk[q + jj * BW];
+                a = blk[q + jj * BW];
+                b = blk[jj + q * BW];
                 col.add(a, ib0 + q, true);
-                cs.add(a);
-                const T b = blk[jj + q * BW];
                 row.add(b, ib0 + q, true);
-                rs.add(b);
             }
-            const S c = col.unsafe ? cs.norm() : sqrt(col.ssq);
-            const S r = row.unsafe ? rs.norm() : sqrt(row.ssq);
+            col.wave_reduce();
+            row.wave_reduce();
+            col.combine(rc.amax, rc.iamax, rc.mod, rc.ssq, rc.unsafe);
+            row.combine(rr.amax, rr.iamax, rr.mod, rr.ssq, rr.unsafe);
+            S c = sqrt(col.ssq);
+            S r = sqrt(row.ssq);
+
+            // (col.unsafe and row.unsafe are the same on all the lanes)
+            if(col.unsafe || row.unsafe)
+            {
+                gebal_scaled_ssq<S> cs, rs;
+                cs.init();
+                rs.init();
+                cs.add(a);
+                rs.add(b);
+                cs.wave_reduce();
+                rs.wave_reduce();
+                cs.combine(rc.se, rc.sssq);
+                rs.combine(rr.se, rr.sssq);
+                if(col.unsafe)
+                    c = cs.norm();
+                if(row.unsafe)
+                    r = rs.norm();
+            }
             const S si = scale[i];
 
             // (f = 0: NaN, the balancing stops; f = 1: no scaling)
@@ -1158,30 +1218,43 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) gebal_mb_decide_kernel(const I n,
             if(f == S(1))
                 continue;
             const S g = S(1) / f;
+            any = true;
 
             // scale row i by g and column i by f in the block; A(i,i) by both, in the same
             // order as LAPACK
-            for(int q = 0; q < nb; q++)
+            if(q < nb)
             {
                 if(q == jj)
-                    continue;
-                blk[jj + q * BW] *= g;
-                blk[q + jj * BW] *= f;
+                {
+                    a *= g;
+                    a *= f;
+                    blk[jj + jj * BW] = a;
+                }
+                else
+                {
+                    b *= g;
+                    a *= f;
+                    blk[jj + q * BW] = b;
+                    blk[q + jj * BW] = a;
+                }
             }
-            T aii = blk[jj + jj * BW];
-            aii *= g;
-            aii *= f;
-            blk[jj + jj * BW] = aii;
-            scale[i] = si * f;
-            fac[jj] = f;
-            any = true;
+            if(q == 0)
+            {
+                scale[i] = si * f;
+                fac[jj] = f;
+            }
+            // (the next decision reads entries written by other lanes)
+            __syncwarp();
         }
-        st.any[bid] = any ? 1 : 0;
-        if(any)
-            st.noconv[bid] = 1;
-        if(nan)
-            st.stop[bid] = 1;
-        s_any = any;
+        if(q == 0)
+        {
+            st.any[bid] = any ? 1 : 0;
+            if(any)
+                st.noconv[bid] = 1;
+            if(nan)
+                st.stop[bid] = 1;
+            s_any = any;
+        }
     }
     __syncthreads();
 
