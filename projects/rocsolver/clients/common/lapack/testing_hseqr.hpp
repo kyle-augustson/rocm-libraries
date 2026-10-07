@@ -56,6 +56,10 @@
                  (ihi - ilo + 1 ~ n/3, few shifts in the multishift sweeps).
     - mtype >= 8: as mtype = 4; a NaN or an infinite entry is set after the reduction to
                  Hessenberg form (see hseqr_nonfinite).
+    - mtype = 18: graded random upper Hessenberg matrix, A(i,j) = G(i,j) * 10^(-(i+j)/2):
+                 for large n, its trailing rows are exactly zero, with a band of subnormal
+                 rows above them (deflation windows, shifts and reflections with subnormal
+                 scale factors).
     For mtype < 4, ilo = 1 and ihi = n.
     Classes 0, 3, 4, 5 and 6 have well-conditioned eigenvalues (in practice). **/
 template <typename T>
@@ -78,7 +82,16 @@ void hseqr_genMatrix(const rocblas_int n,
     if(n == 0)
         return;
 
-    if(mtype == 0 || mtype == 4 || mtype == 6 || mtype >= 8)
+    if(mtype == 18)
+    {
+        // upper Hessenberg, A(i,j) = G(i,j) * 10^(-(i+j)/2) for i <= j + 1: for n > 300 or
+        // so, the trailing rows are exactly zero and a band of rows above them is subnormal
+        // (not reduced with GEHRD, see testing_hseqr)
+        for(rocblas_int j = 0; j < n; j++)
+            for(rocblas_int i = 0; i <= std::min(j + 1, n - 1); i++)
+                A[i + size_t(j) * n] = rnd() * S(std::pow(10.0, -0.5 * (i + j)));
+    }
+    else if(mtype == 0 || mtype == 4 || mtype == 6 || (mtype >= 8 && mtype < 18))
     {
         for(auto& a : A)
             a = rnd();
@@ -139,7 +152,7 @@ void hseqr_genMatrix(const rocblas_int n,
         cpu_gebal(rocsolver_balance_both, n, A.data(), n, &ilo, &ihi, scale.data(), &info);
     }
 
-    if(mtype == 4 || mtype >= 8)
+    if(mtype == 4 || (mtype >= 8 && mtype < 18))
     {
         // isolated eigenvalues and bad scaling (see gebal_genMatrix), then balance
         gebal_genMatrix(n, A.data(), n, 2, seed);
@@ -202,7 +215,7 @@ rocblas_int hseqr_nonfinite(const rocblas_int mtype,
     };
     const rocblas_int m = (ilo + ihi) / 2;
     splits.clear();
-    if(mtype < 8 || ilo >= ihi)
+    if(mtype < 8 || mtype >= 18 || ilo >= ihi)
         return 0;
     switch(mtype)
     {
@@ -402,8 +415,13 @@ void hseqr_initData(const rocblas_handle handle,
             hIlo[b][0] = ilo;
             hIhi[b][0] = ihi;
 
-            // reduce to Hessenberg form
-            cpu_gehrd(n, ilo, ihi, A.data(), n, tau.data(), work.data(), (rocblas_int)work.size());
+            // reduce to Hessenberg form (class 18 is generated in Hessenberg form: the reduction
+            // would make its subdiagonal real, and it is kept as it is, with Q = I)
+            if(mt == 18)
+                std::fill(tau.begin(), tau.end(), T(0));
+            else
+                cpu_gehrd(n, ilo, ihi, A.data(), n, tau.data(), work.data(),
+                          (rocblas_int)work.size());
             for(rocblas_int j = 0; j < n; j++)
                 for(rocblas_int i = 0; i < n; i++)
                     hH0[b][i + size_t(j) * ldh] = (i <= j + 1) ? A[i + size_t(j) * n] : T(0);
@@ -732,7 +750,7 @@ void hseqr_getError(const rocblas_handle handle,
         // eigenvalues with well-conditioned eigenvalues are compared with the host LAPACK
         const bool compare_eigenvalues = (mt == 0 || mt == 3 || mt == 4 || mt == 5 || mt == 6);
 
-        if(mt >= 8 && ilo < ihi)
+        if(mt >= 8 && mt < 18 && ilo < ihi)
         {
             hseqr_checkNonfinite(job, compz, n, ilo, ihi, hH0[b], ldh, hZ0[b], ldz, hHRes[b],
                                  hWRes[b], hZRes[b], hInfoRes[b][0], mt, b, max_err, max_err_eig);
@@ -773,16 +791,15 @@ void hseqr_getError(const rocblas_handle handle,
         // error |sum(W) - trace(H0)| / (sqrt(n) * ||H0||)
         {
             T sumw = 0, trace = 0;
-            double hnorm2 = 0;
             for(rocblas_int j = 0; j < n; j++)
             {
                 sumw += hWRes[b][j];
                 trace += hH0[b][j + size_t(j) * ldh];
-                for(rocblas_int i = 0; i < n; i++)
-                    hnorm2 += std::norm(hH0[b][i + size_t(j) * ldh]);
             }
+            // (the norm with scaling, as the squares of tiny entries underflow)
+            const double hnorm = snorm('F', n, n, hH0[b], ldh);
             const double err
-                = std::abs(sumw - trace) / std::max(std::sqrt(double(n) * hnorm2), 1e-300);
+                = std::abs(sumw - trace) / std::max(std::sqrt(double(n)) * hnorm, 1e-300);
             *max_err_eig = std::max(*max_err_eig, err);
         }
 

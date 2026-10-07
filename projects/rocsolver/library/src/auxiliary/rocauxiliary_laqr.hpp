@@ -687,8 +687,8 @@ __device__ void hqr_laqr1(const int nn, const T* H, const I ldh, const T s1, con
         }
         else
         {
-            T h21s = h(2, 1) / s;
-            v[0] = h21s * h(1, 2) + (h(1, 1) - s1) * ((h(1, 1) - s2) / s);
+            T h21s = hqr_cdivr(h(2, 1), s);
+            v[0] = h21s * h(1, 2) + (h(1, 1) - s1) * hqr_cdivr(h(1, 1) - s2, s);
             v[1] = h21s * (h(1, 1) + h(2, 2) - s1 - s2);
         }
     }
@@ -703,9 +703,9 @@ __device__ void hqr_laqr1(const int nn, const T* H, const I ldh, const T s1, con
         }
         else
         {
-            T h21s = h(2, 1) / s;
-            T h31s = h(3, 1) / s;
-            v[0] = (h(1, 1) - s1) * ((h(1, 1) - s2) / s) + h(1, 2) * h21s;
+            T h21s = hqr_cdivr(h(2, 1), s);
+            T h31s = hqr_cdivr(h(3, 1), s);
+            v[0] = (h(1, 1) - s1) * hqr_cdivr(h(1, 1) - s2, s) + h(1, 2) * h21s;
             v[1] = h21s * (h(1, 1) + h(2, 2) - s1 - s2);
             v[2] = h31s * (h(1, 1) + h(3, 3) - s1 - s2) + h21s * h(3, 2);
             // (h(3,1) is zero when a bulge is introduced at the top of the active block; then
@@ -1524,11 +1524,11 @@ __host__ __device__ void laqr0_shifts_tail(const bool sort,
         // in case of a rare QR failure use eigenvalues of the trailing 2-by-2
         // principal submatrix; scale to avoid overflows, underflows and subnormals
         S sc = hqr_cabs1(hb[0]) + hqr_cabs1(hb[1]) + hqr_cabs1(hb[2]) + hqr_cabs1(hb[3]);
-        T aa = hb[0] / sc;
-        T cc = hb[1] / sc;
-        T bb = hb[2] / sc;
-        T dd = hb[3] / sc;
-        T tr2 = (aa + dd) / S(2);
+        T aa = hqr_cdivr(hb[0], sc);
+        T cc = hqr_cdivr(hb[1], sc);
+        T bb = hqr_cdivr(hb[2], sc);
+        T dd = hqr_cdivr(hb[3], sc);
+        T tr2 = hqr_cdivr(aa + dd, S(2));
         T det = (aa - tr2) * (dd - tr2) - bb * cc;
         T rtdisc = hqr_csqrt(T(-det.real(), -det.imag()));
         hqr_sync();

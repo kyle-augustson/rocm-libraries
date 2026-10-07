@@ -54,6 +54,7 @@ typedef std::tuple<vector<int>, vector<char>> hseqr_tuple;
 // at once: info = 0 and W = diag(H)), a 1x1 block with an infinite entry between two
 // irreducible blocks (16, info = 0), and a NaN above a trailing 1x1 block (17, info = ihi-1
 // and W(ihi) = H(ihi,ihi))
+// mtype = 18: graded Hessenberg matrix whose trailing rows are subnormal or zero
 // (n > 75 uses the multishift QR algorithm)
 // (see hseqr_genMatrix; the input is reduced to Hessenberg form with the host GEHRD)
 
@@ -121,6 +122,8 @@ const vector<vector<int>> large_matrix_size_range = {
     {300, 320, 300, 0},
     {500, 500, 500, 2},
     {800, 800, 800, 0},
+    // graded matrix with subnormal entries
+    {700, 700, 700, 18},
     // n >= 3000 (128 shifts recommended by IPARMQ, capped at the deflation window)
     {3000, 3000, 3000, 0},
 };
@@ -270,6 +273,8 @@ INSTANTIATE_TEST_SUITE_P(checkin_lapack,
 // hybrid mode, large sizes (n >= 3000: more shifts than the deflation window gives)
 const vector<vector<int>> large_hybrid_size_range = {
     {800, 800, 800, 0},
+    // graded matrix with subnormal entries
+    {700, 700, 700, 18},
     {3000, 3000, 3000, 0},
 };
 

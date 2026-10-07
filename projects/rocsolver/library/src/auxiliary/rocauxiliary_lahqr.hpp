@@ -97,6 +97,18 @@ __host__ __device__ inline S hqr_cabs1(const T z)
     return std::abs(z.real()) + std::abs(z.imag());
 }
 
+/** HQR_CDIVR returns a / b; when a is complex and b real, it divides each component by b, as
+    Fortran does. (rocblas_complex_num has no complex / real operator: b is converted to a complex
+    number, and the complex division forms 1 / b, which overflows for subnormal b.) **/
+template <typename A, typename B>
+__host__ __device__ inline A hqr_cdivr(const A a, const B b)
+{
+    if constexpr(rocblas_is_complex<A> && !rocblas_is_complex<B>)
+        return A(a.real() / b, a.imag() / b);
+    else
+        return a / b;
+}
+
 /** HQR_LAPY3 computes sqrt(x^2 + y^2 + z^2) avoiding unnecessary overflow
     (LAPACK xLAPY3). **/
 template <typename S>
@@ -318,13 +330,13 @@ __host__ __device__ void hqr_lartg(const T f, const T g, S& c, T& s, T& r)
         {
             S rr = std::abs(g.imag());
             r = T(rr);
-            s = conj(g) / rr;
+            s = hqr_cdivr(conj(g), rr);
         }
         else if(g.imag() == zero)
         {
             S rr = std::abs(g.real());
             r = T(rr);
-            s = conj(g) / rr;
+            s = hqr_cdivr(conj(g), rr);
         }
         else
         {
@@ -334,16 +346,16 @@ __host__ __device__ void hqr_lartg(const T f, const T g, S& c, T& s, T& r)
             {
                 S g2 = abssq(g);
                 S d = std::sqrt(g2);
-                s = conj(g) / d;
+                s = hqr_cdivr(conj(g), d);
                 r = T(d);
             }
             else
             {
                 S u = std::min(safmax, std::max(safmin, g1));
-                T gs = g / u;
+                T gs = hqr_cdivr(g, u);
                 S g2 = abssq(gs);
                 S d = std::sqrt(g2);
-                s = conj(gs) / d;
+                s = hqr_cdivr(conj(gs), d);
                 r = T(d * u);
             }
         }
@@ -361,28 +373,28 @@ __host__ __device__ void hqr_lartg(const T f, const T g, S& c, T& s, T& r)
             if(f2 >= h2 * safmin)
             {
                 c = std::sqrt(f2 / h2);
-                r = f / c;
+                r = hqr_cdivr(f, c);
                 rtmax = rtmax * 2;
                 if(f2 > rtmin && h2 < rtmax)
-                    s = conj(g) * (f / std::sqrt(f2 * h2));
+                    s = conj(g) * hqr_cdivr(f, std::sqrt(f2 * h2));
                 else
-                    s = conj(g) * (r / h2);
+                    s = conj(g) * hqr_cdivr(r, h2);
             }
             else
             {
                 S d = std::sqrt(f2 * h2);
                 c = f2 / d;
                 if(c >= safmin)
-                    r = f / c;
+                    r = hqr_cdivr(f, c);
                 else
                     r = (h2 / d) * f;
-                s = conj(g) * (f / d);
+                s = conj(g) * hqr_cdivr(f, d);
             }
         }
         else
         {
             S u = std::min(safmax, std::max(safmin, std::max(f1, g1)));
-            T gs = g / u;
+            T gs = hqr_cdivr(g, u);
             S g2 = abssq(gs);
             S w, f2, h2;
             T fs;
@@ -390,36 +402,36 @@ __host__ __device__ void hqr_lartg(const T f, const T g, S& c, T& s, T& r)
             {
                 S v = std::min(safmax, std::max(safmin, f1));
                 w = v / u;
-                fs = f / v;
+                fs = hqr_cdivr(f, v);
                 f2 = abssq(fs);
                 h2 = f2 * (w * w) + g2;
             }
             else
             {
                 w = one;
-                fs = f / u;
+                fs = hqr_cdivr(f, u);
                 f2 = abssq(fs);
                 h2 = f2 + g2;
             }
             if(f2 >= h2 * safmin)
             {
                 c = std::sqrt(f2 / h2);
-                r = fs / c;
+                r = hqr_cdivr(fs, c);
                 rtmax = rtmax * 2;
                 if(f2 > rtmin && h2 < rtmax)
-                    s = conj(gs) * (fs / std::sqrt(f2 * h2));
+                    s = conj(gs) * hqr_cdivr(fs, std::sqrt(f2 * h2));
                 else
-                    s = conj(gs) * (r / h2);
+                    s = conj(gs) * hqr_cdivr(r, h2);
             }
             else
             {
                 S d = std::sqrt(f2 * h2);
                 c = f2 / d;
                 if(c >= safmin)
-                    r = fs / c;
+                    r = hqr_cdivr(fs, c);
                 else
                     r = (h2 / d) * fs;
-                s = conj(gs) * (fs / d);
+                s = conj(gs) * hqr_cdivr(fs, d);
             }
             c = c * w;
             r = u * r;
@@ -544,8 +556,8 @@ __host__ __device__ __forceinline__ I lahqr_block(const bool wantt,
         {
             // the following redundant normalization avoids problems with both
             // gradual and sudden underflow in abs(h(i,i-1))
-            T sc = hi / hqr_cabs1(hi);
-            sc = conj(sc) / std::abs(sc);
+            T sc = hqr_cdivr(hi, hqr_cabs1(hi));
+            sc = hqr_cdivr(conj(sc), std::abs(sc));
             S habs = std::abs(hi);
             hqr_sync();
 
@@ -694,12 +706,12 @@ __host__ __device__ __forceinline__ I lahqr_block(const bool wantt,
                     T x = half * (h(i - 1, i - 1) - t);
                     S sx = hqr_cabs1(x);
                     s = std::max(s, hqr_cabs1(x));
-                    T xs = x / s;
-                    T us = u / s;
+                    T xs = hqr_cdivr(x, s);
+                    T us = hqr_cdivr(u, s);
                     T y = s * hqr_csqrt(xs * xs + us * us);
                     if(sx > rzero)
                     {
-                        T xsx = x / sx;
+                        T xsx = hqr_cdivr(x, sx);
                         if(xsx.real() * y.real() + xsx.imag() * y.imag() < rzero)
                             y = -y;
                     }
@@ -716,8 +728,8 @@ __host__ __device__ __forceinline__ I lahqr_block(const bool wantt,
                 T h11s = h11 - t;
                 S h21 = h(m + 1, m).real();
                 S s = hqr_cabs1(h11s) + std::abs(h21);
-                v1 = h11s / s;
-                v2 = h21 / s;
+                v1 = hqr_cdivr(h11s, s);
+                v2 = hqr_cdivr(h21, s);
             };
             I mfound = 0;
             for(I m = i - 1 - tid; m >= l + 1; m -= BS)
@@ -814,7 +826,7 @@ __host__ __device__ __forceinline__ I lahqr_block(const bool wantt,
                     // consecutive small subdiagonals were found, then extra
                     // scaling must be performed to ensure that h(m,m-1) remains real.
                     T temp = T(1) - t1;
-                    temp = temp / std::abs(temp);
+                    temp = hqr_cdivr(temp, std::abs(temp));
                     if(tid == 0)
                     {
                         h(m + 1, m) = h(m + 1, m) * conj(temp);
@@ -856,7 +868,7 @@ __host__ __device__ __forceinline__ I lahqr_block(const bool wantt,
             if(temp.imag() != rzero)
             {
                 S rtemp = std::abs(temp);
-                temp = temp / rtemp;
+                temp = hqr_cdivr(temp, rtemp);
                 for(I j = i + 1 + tid; j <= i2; j += BS)
                     h(i, j) = conj(temp) * h(i, j);
                 for(I j = i1 + tid; j <= i - 1; j += BS)
@@ -923,11 +935,12 @@ __device__ inline T hqr_larfg2_fast(T& alpha, T& x)
     const S xr = x.real(), xi = x.imag();
     const S ar = alpha.real(), ai = alpha.imag();
     const S xn2 = xr * xr + xi * xi;
-    if(xn2 == 0 && ai == 0)
+    if(xr == 0 && xi == 0 && ai == 0)
         return T(0);
     const S big = std::is_same<S, double>::value ? S(1e100) : S(1e15);
     const S m = std::max(std::max(std::abs(ar), std::abs(ai)), std::sqrt(xn2));
-    if(!(m < big && m > S(1) / big))
+    // (|x|^2 underflows for a tiny x: then the scaled version, as xLARFG)
+    if(!(m < big && m > S(1) / big) || xn2 < std::numeric_limits<S>::min())
     {
         T tau;
         hqr_larfg<2>(alpha, &x, tau);
@@ -991,8 +1004,8 @@ __device__ __forceinline__ I
         T hi = h(i, i - 1);
         if(hi.imag() != rzero)
         {
-            T sc = hi / hqr_cabs1(hi);
-            sc = conj(sc) / std::abs(sc);
+            T sc = hqr_cdivr(hi, hqr_cabs1(hi));
+            sc = hqr_cdivr(conj(sc), std::abs(sc));
             S habs = std::abs(hi);
             __syncthreads();
             for(I j = i + tid; j <= i2; j += BS)
@@ -1098,12 +1111,12 @@ __device__ __forceinline__ I
                     T x = half * (h(i - 1, i - 1) - t);
                     S sx = hqr_cabs1(x);
                     s = std::max(s, hqr_cabs1(x));
-                    T xs = x / s;
-                    T us = u / s;
+                    T xs = hqr_cdivr(x, s);
+                    T us = hqr_cdivr(u, s);
                     T y = s * hqr_csqrt(xs * xs + us * us);
                     if(sx > rzero)
                     {
-                        T xsx = x / sx;
+                        T xsx = hqr_cdivr(x, sx);
                         if(xsx.real() * y.real() + xsx.imag() * y.imag() < rzero)
                             y = -y;
                     }
@@ -1115,8 +1128,8 @@ __device__ __forceinline__ I
                 T h11s = h(m, m) - t;
                 S h21 = h(m + 1, m).real();
                 S s = hqr_cabs1(h11s) + std::abs(h21);
-                v1 = h11s / s;
-                v2 = h21 / s;
+                v1 = hqr_cdivr(h11s, s);
+                v2 = hqr_cdivr(h21, s);
             };
             // the largest m in l+1:i-1 where two consecutive small subdiagonal entries are
             // found, or l
@@ -1200,7 +1213,7 @@ __device__ __forceinline__ I
                 {
                     // extra scaling to keep h(m,m-1) real (see lahqr_block)
                     T temp = T(1) - t1;
-                    temp = temp / std::abs(temp);
+                    temp = hqr_cdivr(temp, std::abs(temp));
                     zscale = true;
                     zsc = conj(temp);
                     if(tid == 0)
@@ -1239,7 +1252,7 @@ __device__ __forceinline__ I
             if(tempf.imag() != rzero)
             {
                 S rtemp = std::abs(tempf);
-                tempf = tempf / rtemp;
+                tempf = hqr_cdivr(tempf, rtemp);
                 zfix = true;
                 for(I j = i + 1 + tid; j <= i2; j += BS)
                     h(i, j) = conj(tempf) * h(i, j);

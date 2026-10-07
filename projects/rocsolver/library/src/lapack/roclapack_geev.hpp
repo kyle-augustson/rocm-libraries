@@ -304,7 +304,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) geev_normalize_kernel(const I n,
     if(k >= n)
         return;
     const T vk = v[k];
-    const T tmp = conj(vk) / std::sqrt(sval[0]);
+    const T tmp = hqr_cdivr(conj(vk), std::sqrt(sval[0]));
     __syncthreads();
 
     for(I i = tid; i < n; i += BS)
