@@ -220,13 +220,19 @@ __device__ S trevc3_xbig(const I n, const S tmax_s)
     the other rows are zero). Applied before the back-transformation Q*X, which would
     overflow for entries near xbig (the growth is up to about n*max|q_ij|). **/
 template <int BS, typename T, typename I>
-ROCSOLVER_KERNEL void __launch_bounds__(BS)
-    trevc3_scale_kernel(const bool left, const I n, const I p0, T* XX, const rocblas_stride strideX)
+ROCSOLVER_KERNEL void __launch_bounds__(BS) trevc3_scale_kernel(const bool left,
+                                                                const I n,
+                                                                const I p0,
+                                                                T* XX,
+                                                                const rocblas_stride strideX,
+                                                                const I* info)
 {
     using S = decltype(std::real(T{}));
 
     const I c = hipBlockIdx_x;
     const I bid = hipBlockIdx_y;
+    if(info && info[bid] > 0)
+        return;
     const I k = p0 + c;
     T* x = XX + bid * strideX + c * size_t(n);
     __shared__ S sred[BS];
@@ -376,9 +382,12 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) trevc3_solve_kernel(const I n,
                                                                 const rocblas_stride strideR,
                                                                 T* XX,
                                                                 const rocblas_stride strideX,
-                                                                const S* tmax_s)
+                                                                const S* tmax_s,
+                                                                const I* info)
 {
     const I bid = hipBlockIdx_y;
+    if(info && info[bid] > 0)
+        return;
     const T* A = load_ptr_batch<T>(TT, bid, shiftT, strideT);
     T* R = RR + bid * strideR;
     T* X = XX + bid * strideX;
@@ -547,12 +556,15 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) trevc3_normalize_kernel(const bool a
                                                                     U VV,
                                                                     const rocblas_stride shiftV,
                                                                     const I ldv,
-                                                                    const rocblas_stride strideV)
+                                                                    const rocblas_stride strideV,
+                                                                    const I* info)
 {
     using S = decltype(std::real(T{}));
 
     const I c = hipBlockIdx_x;
     const I bid = hipBlockIdx_y;
+    if(info && info[bid] > 0)
+        return;
     const I k = p0 + c;
     const T* x = XX + bid * strideX + c * size_t(n);
     T* v = load_ptr_batch<T>(VV, bid, shiftV, strideV) + k * size_t(ldv);
@@ -682,7 +694,8 @@ rocblas_status rocsolver_trevc3_template(rocblas_handle handle,
                                          T* tmp,
                                          T* R,
                                          void* tmax,
-                                         T** workArr)
+                                         T** workArr,
+                                         const I* info = nullptr)
 {
     ROCSOLVER_ENTER("trevc3", "side:", side, "howmny:", howmny, "n:", n, "shiftT:", shiftT,
                     "ldt:", ldt, "shiftVL:", shiftVL, "ldvl:", ldvl, "shiftVR:", shiftVR,
@@ -746,7 +759,7 @@ rocblas_status rocsolver_trevc3_template(rocblas_handle handle,
                 ROCSOLVER_LAUNCH_KERNEL((trevc3_solve_kernel<false, NB, BS, T>),
                                         dim3((ncols - 1) / BS + 1, batch_count), dim3(BS), 0,
                                         stream, n, A, shiftT, ldt, strideT, i0, nb, p0, p1, R,
-                                        strideR, X, strideX, tmaxS);
+                                        strideR, X, strideX, tmaxS, info);
             }
 
             // back-transformation and normalization
@@ -754,7 +767,7 @@ rocblas_status rocsolver_trevc3_template(rocblas_handle handle,
             if(over)
             {
                 ROCSOLVER_LAUNCH_KERNEL((trevc3_scale_kernel<BS, T>), dim3(nc, batch_count),
-                                        dim3(BS), 0, stream, false, n, p0, X, strideX);
+                                        dim3(BS), 0, stream, false, n, p0, X, strideX, info);
                 rocblasCall_gemm(handle, rocblas_operation_none, rocblas_operation_none, n, nc, p1,
                                  &one, VR, shiftVR, ldvr, strideVR, X, 0, n, strideX, &zero, tmp, 0,
                                  n, strideX, batch_count, workArr);
@@ -762,7 +775,7 @@ rocblas_status rocsolver_trevc3_template(rocblas_handle handle,
             }
             ROCSOLVER_LAUNCH_KERNEL((trevc3_normalize_kernel<BS, T>), dim3(nc, batch_count),
                                     dim3(BS), 0, stream, !over, false, n, p0, src, strideX, VR,
-                                    shiftVR, ldvr, strideVR);
+                                    shiftVR, ldvr, strideVR, info);
         }
     }
 
@@ -795,7 +808,7 @@ rocblas_status rocsolver_trevc3_template(rocblas_handle handle,
                 ROCSOLVER_LAUNCH_KERNEL((trevc3_solve_kernel<true, NB, BS, T>),
                                         dim3((ncols - 1) / BS + 1, batch_count), dim3(BS), 0,
                                         stream, n, A, shiftT, ldt, strideT, i0, nb, p0, p1, R,
-                                        strideR, X, strideX, tmaxS);
+                                        strideR, X, strideX, tmaxS, info);
             }
 
             // back-transformation and normalization
@@ -803,7 +816,7 @@ rocblas_status rocsolver_trevc3_template(rocblas_handle handle,
             if(over)
             {
                 ROCSOLVER_LAUNCH_KERNEL((trevc3_scale_kernel<BS, T>), dim3(nc, batch_count),
-                                        dim3(BS), 0, stream, true, n, p0, X, strideX);
+                                        dim3(BS), 0, stream, true, n, p0, X, strideX, info);
                 rocblasCall_gemm(handle, rocblas_operation_none, rocblas_operation_none, n, nc,
                                  n - p0, &one, VL, shiftVL + idx2D(0, p0, ldvl), ldvl, strideVL, X,
                                  idx2D(p0, 0, n), n, strideX, &zero, tmp, 0, n, strideX,
@@ -812,7 +825,7 @@ rocblas_status rocsolver_trevc3_template(rocblas_handle handle,
             }
             ROCSOLVER_LAUNCH_KERNEL((trevc3_normalize_kernel<BS, T>), dim3(nc, batch_count),
                                     dim3(BS), 0, stream, false, !over, n, p0, src, strideX, VL,
-                                    shiftVL, ldvl, strideVL);
+                                    shiftVL, ldvl, strideVL, info);
         }
     }
 

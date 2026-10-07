@@ -706,9 +706,9 @@ rocblas_status rocsolver_geev_template(rocblas_handle handle,
         // As in ZGEEV, no eigenvectors are computed if HSEQR failed (info > 0). For a single
         // matrix, info is read back (a synchronization) and the remaining stages are skipped:
         // VL and VR are left with the Schur vectors computed by HSEQR, as in LAPACK. In a batch,
-        // TREVC3 still runs for all the matrices, but GEBAK and the normalization skip those
-        // with info > 0, whose VL and VR are left with the back-transformed eigenvectors of
-        // their partial Schur form (in both cases, the documented contents are undefined).
+        // the kernels of TREVC3, GEBAK and the normalization skip the matrices with info > 0,
+        // so that their VL and VR are also left with the Schur vectors (the documented contents
+        // are undefined).
         bool failed = false;
         if(batch_count == 1)
         {
@@ -727,7 +727,7 @@ rocblas_status rocsolver_geev_template(rocblas_handle handle,
             ROCBLAS_CHECK(rocsolver_trevc3_template<BATCHED, STRIDED, T>(
                 handle, side, rocsolver_eigenvectors_backtransform, n, A, shiftA, lda, strideA, VL,
                 shiftVL, ldvl, strideVL, VR, shiftVR, ldvr, strideVR, batch_count, (T*)work1,
-                (T*)work2, (T*)work3, work4, (T**)work5));
+                (T*)work2, (T*)work3, work4, (T**)work5, (const I*)info));
 
             // undo the balancing, and normalize
             if(leftv)
