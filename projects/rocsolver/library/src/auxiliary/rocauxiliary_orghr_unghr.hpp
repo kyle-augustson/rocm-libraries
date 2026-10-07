@@ -39,6 +39,71 @@
 
 ROCSOLVER_BEGIN_NAMESPACE
 
+#define ORGHR_SHIFT_THREADS 64 // threads per block in orghr_shift_right
+#define ORGHR_SHIFT_UNROLL 4 // columns per thread and iteration in orghr_shift_right
+
+/** ORGHR_SHIFT_RIGHT sets the nh+1 columns ilo-1:ihi-1 (0-indexed) of the n x n matrix A as
+    required by ORGHR/UNGHR before calling ORGQR/UNGQR on A[ilo:ihi-1, ilo:ihi-1]:
+    - the Householder vectors are shifted one column to the right, i.e.
+      A[i, j] = A[i, j-1] for ilo <= i <= ihi-1 and ilo <= j <= i-1,
+    - A[ilo-1:ihi-1, ilo-1] = A[ilo-1, ilo-1:ihi-1] = e0, and
+    - A[0:ilo-2, ilo-1:ihi-1] = A[ihi:n-1, ilo-1:ihi-1] = 0.
+    The diagonal and upper triangular part of A[ilo:ihi-1, ilo:ihi-1] are not referenced.
+    Each thread owns one row, so the shift is done in place without synchronization;
+    the threads of a block access consecutive rows of a column at a time (coalesced).
+    Call this kernel with ORGHR_SHIFT_THREADS threads per block and a grid of
+    (ceil(n / ORGHR_SHIFT_THREADS), 1, batch_count) blocks. **/
+template <typename T, typename U>
+ROCSOLVER_KERNEL void __launch_bounds__(ORGHR_SHIFT_THREADS)
+    orghr_shift_right(const rocblas_int n,
+                      const rocblas_int ilo,
+                      const rocblas_int ihi,
+                      U A,
+                      const rocblas_stride shiftA,
+                      const rocblas_int lda,
+                      const rocblas_stride strideA)
+{
+    const rocblas_int b = hipBlockIdx_z;
+    const rocblas_int i = hipBlockIdx_x * ORGHR_SHIFT_THREADS + hipThreadIdx_x;
+    if(i >= n)
+        return;
+
+    // Ar points to A[i, ilo-1]
+    T* Ar = load_ptr_batch<T>(A, b, shiftA + idx2D(i, ilo - 1, lda), strideA);
+
+    if(i >= ilo && i < ihi)
+    {
+        // row of the active block: A[i, ilo-1:i-1] = [0, A[i, ilo-1:i-2]]
+        // (left to right, carrying the overwritten entry in a register)
+        const rocblas_int nc = i - ilo + 1;
+        T carry = 0;
+        for(rocblas_int c = 0; c < nc; c += ORGHR_SHIFT_UNROLL)
+        {
+            T v[ORGHR_SHIFT_UNROLL];
+#pragma unroll
+            for(rocblas_int k = 0; k < ORGHR_SHIFT_UNROLL; k++)
+                if(c + k < nc)
+                    v[k] = Ar[idx2D(0, c + k, lda)];
+#pragma unroll
+            for(rocblas_int k = 0; k < ORGHR_SHIFT_UNROLL; k++)
+            {
+                if(c + k < nc)
+                {
+                    Ar[idx2D(0, c + k, lda)] = carry;
+                    carry = v[k];
+                }
+            }
+        }
+    }
+    else
+    {
+        // row ilo-1 is e0; rows above ilo-1 or below ihi-1 are zero
+        const rocblas_int nc = ihi - ilo + 1;
+        for(rocblas_int c = 0; c < nc; c++)
+            Ar[idx2D(0, c, lda)] = (i == ilo - 1 && c == 0) ? T(1) : T(0);
+    }
+}
+
 template <bool BATCHED, typename T>
 void rocsolver_orghr_unghr_getMemorySize(const rocblas_int n,
                                          const rocblas_int ilo,
@@ -62,15 +127,10 @@ void rocsolver_orghr_unghr_getMemorySize(const rocblas_int n,
         return;
     }
 
-    // extra workspace for the copyshift_right staging buffer (nh*(nh+1)/2 elements per batch)
-    size_t w1 = sizeof(T) * batch_count * nh * (nh + 1) / 2;
-
     // requirements for calling orgqr/ungqr on the nh x nh subblock
-    size_t w2;
-    rocsolver_orgqr_ungqr_getMemorySize<BATCHED, T>(nh, nh, nh, batch_count, size_scalars, &w2,
+    // (the shift of the Householder vectors is done in place)
+    rocsolver_orgqr_ungqr_getMemorySize<BATCHED, T>(nh, nh, nh, batch_count, size_scalars, size_work,
                                                     size_Abyx_tmptr, size_trfact, size_workArr);
-
-    *size_work = std::max(w1, w2);
 }
 
 template <typename T, typename U>
@@ -155,54 +215,21 @@ rocblas_status rocsolver_orghr_unghr_template(rocblas_handle handle,
         rocblas_int sub_dim = n - ihi;
 
         // zero rows 0..ihi-1
-        rocblas_int bx = (ihi - 1) / BS2 + 1;
-        rocblas_int by = (sub_dim - 1) / BS2 + 1;
-        ROCSOLVER_LAUNCH_KERNEL(set_zero<T>, dim3(bx, by, batch_count), dim3(BS2, BS2), 0, stream,
-                                ihi, sub_dim, A, shiftA + idx2D(0, ihi, lda), lda, strideA);
+        rocsolver_laset_template<T>(handle, rocblas_fill_full, ihi, sub_dim, T{0}, T{0}, A,
+                                    shiftA + idx2D(0, ihi, lda), lda, strideA, batch_count);
 
         // rows ihi..n-1
         rocsolver_laset_template<T>(handle, rocblas_fill_full, sub_dim, sub_dim, T{0}, T{1}, A,
                                     shiftA + idx2D(ihi, ihi, lda), lda, strideA, batch_count);
     }
 
-    // Shift the nh Householder vectors one column to the right within the active subblock.
-    // sets A[ilo:ihi-1, ilo:ihi-1] = A[ilo-1:ihi-1, ilo-1:ihi-2] (0-indexed)
-    // sets A[ilo-1:ihi-1, ilo-1] = e0
-    // sets A[ilo-1, ilo-1:ihi-1] = e0
-    rocblas_int ldw = nh;
-    rocblas_stride strideW = rocblas_stride(nh) * (nh + 1) / 2;
-    rocblas_int shift_blocks = (nh - 1) / BS2 + 1;
-
-    // copy phase: save the strict lower triangle of the nh x nh subblock into work
-    ROCSOLVER_LAUNCH_KERNEL(copyshift_right<T>, dim3(shift_blocks, shift_blocks, batch_count),
-                            dim3(BS2, BS2), 0, stream, true, nh, A,
-                            shiftA + idx2D(ilo - 1, ilo - 1, lda), lda, strideA, work, 0, ldw,
-                            strideW);
-
-    // shift phase: write the staged data back one column to the right
-    ROCSOLVER_LAUNCH_KERNEL(copyshift_right<T>, dim3(shift_blocks, shift_blocks, batch_count),
-                            dim3(BS2, BS2), 0, stream, false, nh, A,
-                            shiftA + idx2D(ilo - 1, ilo - 1, lda), lda, strideA, work, 0, ldw,
-                            strideW);
-
-    // zero the top part of the active columns A[0:ilo-2, ilo-1:ihi-1]
-    if(ilo > 1)
-    {
-        rocblas_int bx = (ilo - 2) / BS2 + 1;
-        rocblas_int by = nh / BS2 + 1;
-        ROCSOLVER_LAUNCH_KERNEL(set_zero<T>, dim3(bx, by, batch_count), dim3(BS2, BS2), 0, stream,
-                                ilo - 1, nh + 1, A, shiftA + idx2D(0, ilo - 1, lda), lda, strideA);
-    }
-
-    // zero the bottom part of the active columns A[ihi:n-1, ilo-1:ihi-1]
-    if(ihi < n)
-    {
-        rocblas_int sub_dim = n - ihi;
-        rocblas_int bx = (sub_dim - 1) / BS2 + 1;
-        rocblas_int by = nh / BS2 + 1;
-        ROCSOLVER_LAUNCH_KERNEL(set_zero<T>, dim3(bx, by, batch_count), dim3(BS2, BS2), 0, stream,
-                                sub_dim, nh + 1, A, shiftA + idx2D(ihi, ilo - 1, lda), lda, strideA);
-    }
+    // active columns ilo-1..ihi-1 (0-indexed): shift the nh Householder vectors one column
+    // to the right in place, and set the first column and row of A[ilo-1:ihi-1, ilo-1:ihi-1]
+    // to e0 and the rest of the columns to zero
+    rocblas_int blocks = (n - 1) / ORGHR_SHIFT_THREADS + 1;
+    ROCSOLVER_LAUNCH_KERNEL(orghr_shift_right<T>, dim3(blocks, 1, batch_count),
+                            dim3(ORGHR_SHIFT_THREADS), 0, stream, n, ilo, ihi, A, shiftA, lda,
+                            strideA);
 
     // apply orgqr/ungqr to the nh x nh subblock at A[ilo, ilo] (0-indexed)
     rocsolver_orgqr_ungqr_template<BATCHED, STRIDED, T>(
