@@ -19101,7 +19101,7 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zgehrd_strided_batched(rocblas_handle 
 
     For n >= 256 (and a job other than rocsolver_balance_none), several kernels are launched per
     matrix, and the host synchronizes with the stream after the permutation step and after each
-    sweep of the scaling step.
+    sweep of the scaling step, so that GEBAL cannot be captured in a HIP graph.
 
     @param[in]
     handle      rocblas_handle.
@@ -19209,7 +19209,7 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zgebal(rocblas_handle handle,
 
     For n >= 256 (and a job other than rocsolver_balance_none), several kernels are launched per
     matrix, and the host synchronizes with the stream after the permutation step and after each
-    sweep of the scaling step.
+    sweep of the scaling step, so that GEBAL cannot be captured in a HIP graph.
 
     @param[in]
     handle      rocblas_handle.
@@ -19332,7 +19332,7 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zgebal_batched(rocblas_handle handle,
 
     For n >= 256 (and a job other than rocsolver_balance_none), several kernels are launched per
     matrix, and the host synchronizes with the stream after the permutation step and after each
-    sweep of the scaling step.
+    sweep of the scaling step, so that GEBAL cannot be captured in a HIP graph.
 
     @param[in]
     handle      rocblas_handle.
@@ -20659,7 +20659,9 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_ztrevc3_strided_batched(rocblas_handle
 
     \note
     GEEV reads the balancing ranges back to the host (to reduce together the matrices with the
-    same range), so that it synchronizes the stream and cannot be captured in a HIP graph.
+    same range), so that it synchronizes the stream and cannot be captured in a HIP graph (GEBAL
+    and HSEQR also synchronize it for large matrices, see \ref rocsolver_cgebal "GEBAL" and
+    \ref rocsolver_chseqr "HSEQR").
 
     @param[in]
     handle      rocblas_handle.
@@ -20755,7 +20757,9 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zgeev(rocblas_handle handle,
 
     \note
     GEEV reads the balancing ranges back to the host (to reduce together the matrices with the
-    same range), so that it synchronizes the stream and cannot be captured in a HIP graph.
+    same range), so that it synchronizes the stream and cannot be captured in a HIP graph (GEBAL
+    and HSEQR also synchronize it for large matrices, see \ref rocsolver_cgebal "GEBAL" and
+    \ref rocsolver_chseqr "HSEQR").
 
     @param[in]
     handle      rocblas_handle.
@@ -20862,7 +20866,9 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zgeev_batched(rocblas_handle handle,
 
     \note
     GEEV reads the balancing ranges back to the host (to reduce together the matrices with the
-    same range), so that it synchronizes the stream and cannot be captured in a HIP graph.
+    same range), so that it synchronizes the stream and cannot be captured in a HIP graph (GEBAL
+    and HSEQR also synchronize it for large matrices, see \ref rocsolver_cgebal "GEBAL" and
+    \ref rocsolver_chseqr "HSEQR").
 
     @param[in]
     handle      rocblas_handle.

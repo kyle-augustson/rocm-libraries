@@ -54,8 +54,8 @@ Full documentation for rocSOLVER is available at the [rocSOLVER documentation](h
 
 ### Known issues
 
-* HSEQR (for n > 75) and GEEV synchronize the stream, so they cannot be captured in a HIP
-  graph.
+* HSEQR (when it uses the multishift QR algorithm), GEBAL (for n >= 256) and GEEV synchronize
+  the stream, so they cannot be captured in a HIP graph.
 
 ### Upcoming changes
 
