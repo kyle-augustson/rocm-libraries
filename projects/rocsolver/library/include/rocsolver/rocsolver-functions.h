@@ -19772,9 +19772,9 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zgebak_strided_batched(rocblas_handle 
     \note
     Matrices with n <= 75 are processed with the single-shift QR algorithm of LAPACK's ZLAHQR,
     and larger ones with the multishift QR algorithm with aggressive early deflation of ZLAQR0,
-    as in LAPACK; batches of at least 4 matrices with n <= 256 are also processed with the
-    former, all the matrices in parallel (which is faster than the latter, one matrix at a
-    time). As in LAPACK, if the former fails (which is rare), the rows where it did not
+    as in LAPACK; batches of matrices with n <= 512 are also processed with the former, all
+    the matrices in parallel, when they have at least max(2, n/80) matrices (then faster than
+    the latter, one matrix at a time). As in LAPACK, if the former fails (which is rare), the rows where it did not
     converge are processed again with the latter (for n < 49, on a copy of order 49 padded with
     zeros); this needs a synchronization of the stream, which is skipped when the stream is
     being captured in a HIP graph (info > 0 is then returned). With
@@ -19894,9 +19894,9 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zhseqr(rocblas_handle handle,
     \note
     Matrices with n <= 75 are processed with the single-shift QR algorithm of LAPACK's ZLAHQR,
     and larger ones with the multishift QR algorithm with aggressive early deflation of ZLAQR0,
-    as in LAPACK; batches of at least 4 matrices with n <= 256 are also processed with the
-    former, all the matrices in parallel (which is faster than the latter, one matrix at a
-    time). As in LAPACK, if the former fails (which is rare), the rows where it did not
+    as in LAPACK; batches of matrices with n <= 512 are also processed with the former, all
+    the matrices in parallel, when they have at least max(2, n/80) matrices (then faster than
+    the latter, one matrix at a time). As in LAPACK, if the former fails (which is rare), the rows where it did not
     converge are processed again with the latter (for n < 49, on a copy of order 49 padded with
     zeros); this needs a synchronization of the stream, which is skipped when the stream is
     being captured in a HIP graph (info > 0 is then returned). With
@@ -20025,9 +20025,9 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zhseqr_batched(rocblas_handle handle,
     \note
     Matrices with n <= 75 are processed with the single-shift QR algorithm of LAPACK's ZLAHQR,
     and larger ones with the multishift QR algorithm with aggressive early deflation of ZLAQR0,
-    as in LAPACK; batches of at least 4 matrices with n <= 256 are also processed with the
-    former, all the matrices in parallel (which is faster than the latter, one matrix at a
-    time). As in LAPACK, if the former fails (which is rare), the rows where it did not
+    as in LAPACK; batches of matrices with n <= 512 are also processed with the former, all
+    the matrices in parallel, when they have at least max(2, n/80) matrices (then faster than
+    the latter, one matrix at a time). As in LAPACK, if the former fails (which is rare), the rows where it did not
     converge are processed again with the latter (for n < 49, on a copy of order 49 padded with
     zeros); this needs a synchronization of the stream, which is skipped when the stream is
     being captured in a HIP graph (info > 0 is then returned). With

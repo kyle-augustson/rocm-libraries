@@ -1347,7 +1347,8 @@ rocblas_status rocsolver_hseqr_template(rocblas_handle handle,
     // small matrices, and batches of medium-size matrices (see HSEQR_BATCH_NMAX):
     // single-shift QR (ZLAHQR), all the matrices of the batch in parallel (when n == 0 the
     // kernel only sets info = 0)
-    if(n <= HSEQR_NMIN || (n <= HSEQR_BATCH_NMAX && batch_count >= HSEQR_BATCH_MIN))
+    const I batch_min = std::max(I(HSEQR_BATCH_MIN), (n + HSEQR_BATCH_NPER - 1) / HSEQR_BATCH_NPER);
+    if(n <= HSEQR_NMIN || (n <= HSEQR_BATCH_NMAX && batch_count >= batch_min))
     {
         I* dilo1 = (n > 0) ? work + LAQR0_STATUS_SIZE : nullptr;
         auto launch = [&](auto bs, auto lds) {
@@ -1375,7 +1376,12 @@ rocblas_status rocsolver_hseqr_template(rocblas_handle handle,
             lds = (int64_t(batch_count) <= int64_t(occupancy) * props->multiProcessorCount);
         }
         if(n > HSEQR_NMIN)
-            launch(integral_constant<int, HSEQR_MEDIUM_BLOCKSIZE>{}, std::false_type{});
+        {
+            if(wave64 && n > 128)
+                launch(integral_constant<int, HSEQR_MEDIUM_BLOCKSIZE_LARGE>{}, std::false_type{});
+            else
+                launch(integral_constant<int, HSEQR_MEDIUM_BLOCKSIZE>{}, std::false_type{});
+        }
         else if(lds)
             launch(integral_constant<int, 64>{}, std::true_type{});
         else if(!wave64 || n <= 32)

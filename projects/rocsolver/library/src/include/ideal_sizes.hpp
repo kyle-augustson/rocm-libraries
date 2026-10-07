@@ -352,9 +352,13 @@
 
 /*! \brief Number of threads of the thread-block that computes the Schur form of each
     medium-size Hessenberg matrix of a batch with the single-shift QR algorithm (see
-    HSEQR_BATCH_NMAX). It must be a multiple of 64. */
+    HSEQR_BATCH_NMAX): HSEQR_MEDIUM_BLOCKSIZE on wave32 targets and for n <= 128, else
+    HSEQR_MEDIUM_BLOCKSIZE_LARGE (fastest on gfx942 and gfx1150). Multiples of 64. */
 #ifndef HSEQR_MEDIUM_BLOCKSIZE
 #define HSEQR_MEDIUM_BLOCKSIZE 128
+#endif
+#ifndef HSEQR_MEDIUM_BLOCKSIZE_LARGE
+#define HSEQR_MEDIUM_BLOCKSIZE_LARGE 256
 #endif
 
 /*! \brief Order of the largest matrix processed by HSEQR with the single-shift QR
@@ -371,20 +375,26 @@
 #define HSEQR_NL 49
 #endif
 
-/*! \brief Batches of at least HSEQR_BATCH_MIN matrices of order n <= HSEQR_BATCH_NMAX are
-    processed by HSEQR with the single-shift QR algorithm (ZLAHQR), all the matrices of the
-    batch in parallel, also when n > HSEQR_NMIN.
+/*! \brief Batches of matrices of order HSEQR_NMIN < n <= HSEQR_BATCH_NMAX are processed by
+    HSEQR with the single-shift QR algorithm (ZLAHQR), all the matrices of the batch in
+    parallel, when the batch has at least max(HSEQR_BATCH_MIN, ceil(n / HSEQR_BATCH_NPER))
+    matrices.
 
-    \details The multishift QR algorithm is driven from the host, one matrix at a time; for
-    a batch of medium-size matrices, the single-shift QR algorithm on all of them in parallel
-    is faster (for example, about 4 times faster for 8 to 32 matrices of order 100 to 300 on a
-    gfx1150; HSEQR_BATCH_NMAX is set below the measured crossover). The rows of the
-    matrices where it fails are processed again with the multishift algorithm, as in LAPACK. */
+    \details The multishift QR algorithm is driven from the host, one matrix at a time, so
+    that its time grows with the batch, while the single-shift QR algorithm on all the
+    matrices in parallel takes about the time of one matrix until the device is full (one
+    matrix per thread-block), and that time grows faster with n. Timings of zhseqr on gfx942
+    and gfx1150 (n = 100 to 500, 1 to 64 matrices) gave the crossover at about n / 80
+    matrices (at least 2). The rows of the matrices where the single-shift algorithm fails are
+    processed again with the multishift algorithm, as in LAPACK. */
 #ifndef HSEQR_BATCH_NMAX
-#define HSEQR_BATCH_NMAX 256
+#define HSEQR_BATCH_NMAX 512
 #endif
 #ifndef HSEQR_BATCH_MIN
-#define HSEQR_BATCH_MIN 4
+#define HSEQR_BATCH_MIN 2
+#endif
+#ifndef HSEQR_BATCH_NPER
+#define HSEQR_BATCH_NPER 80
 #endif
 
 /*! \brief Maximum number of simultaneous shifts of the multishift QR sweeps of HSEQR

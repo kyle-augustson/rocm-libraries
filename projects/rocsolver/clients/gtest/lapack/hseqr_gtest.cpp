@@ -114,6 +114,7 @@ const vector<vector<int>> matrix_size_range = {
     {50, 50, 50, 17},
     {120, 120, 120, 17},
     // batches of medium-size matrices (single-shift algorithm, all the matrices in parallel)
+    {100, 100, 100, 0, 2},
     {100, 100, 100, 0, 4},
     {150, 160, 150, 2, 5},
     {120, 120, 120, 12, 4},
@@ -131,6 +132,8 @@ const vector<vector<int>> large_matrix_size_range = {
     {800, 800, 800, 0},
     // graded matrix with subnormal entries
     {700, 700, 700, 18},
+    // batch of medium-size matrices (single-shift algorithm, all the matrices in parallel)
+    {400, 400, 400, 0, 5},
     // n >= 3000 (128 shifts recommended by IPARMQ, capped at the deflation window)
     {3000, 3000, 3000, 0},
 };
