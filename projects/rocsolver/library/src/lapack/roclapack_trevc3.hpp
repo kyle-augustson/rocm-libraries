@@ -92,7 +92,9 @@ __device__ S trevc3_block_max(S v, S* sred)
     (trevc3_rowsums_kernel, a thread-block per 64 rows) are computed by many thread-blocks,
     each sum in a fixed order; their maximum is taken with atomic operations on the bits of
     the (non-negative) sums, whose order does not change it, so the result is deterministic.
-    Sums that are NaN are ignored. **/
+    The entries that are not finite (Inf or NaN) are left out of the sums: only the vectors
+    that involve them can use them (see trevc3_solve_kernel), and these are not finite
+    anyway, while a non-finite tmax would make xbig zero for all the vectors. **/
 template <typename S>
 __device__ void trevc3_atomic_max(S* p, const S v)
 {
@@ -124,7 +126,9 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) trevc3_colsums_kernel(const I n,
         for(I l = lane; l < j; l += warpSize)
         {
             const T t = A[l + j * size_t(ldt)];
-            cs += std::abs(t.real()) * c + std::abs(t.imag()) * c;
+            const S v = std::abs(t.real()) * c + std::abs(t.imag()) * c;
+            if(v <= std::numeric_limits<S>::max())
+                cs += v;
         }
         for(int off = warpSize / 2; off > 0; off /= 2)
             cs += __shfl_down(cs, off);
@@ -160,7 +164,9 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) trevc3_rowsums_kernel(const I n,
         if(i < n && l > i)
         {
             const T t = A[i + l * size_t(ldt)];
-            rs += std::abs(t.real()) * c + std::abs(t.imag()) * c;
+            const S v = std::abs(t.real()) * c + std::abs(t.imag()) * c;
+            if(v <= std::numeric_limits<S>::max())
+                rs += v;
         }
     }
     __shared__ S part[BS];
@@ -239,6 +245,94 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS)
         x[r] = T(x[r].real() / m, x[r].imag() / m);
 }
 
+/** TREVC3_ISFINITE returns whether the real and imaginary parts of z are finite. **/
+template <typename T>
+__device__ bool trevc3_isfinite(const T z)
+{
+    return std::isfinite(z.real()) && std::isfinite(z.imag());
+}
+
+/** TREVC3_UNROLL calls f(std::integral_constant<int, j>{}) for j = 0:N-1, i.e. a loop
+    unrolled in the source, so that f can index register arrays with j whatever the
+    unrolling thresholds of the target (with a loop and #pragma unroll, the substitution
+    of trevc3_solve_kernel in double complex is too large for them on gfx11, which leaves
+    x in scratch memory). **/
+template <typename F, int... J>
+__device__ __forceinline__ void trevc3_unroll_seq(F& f, std::integer_sequence<int, J...>)
+{
+    (f(std::integral_constant<int, J>{}), ...);
+}
+
+template <int N, typename F>
+__device__ __forceinline__ void trevc3_unroll(F&& f)
+{
+    trevc3_unroll_seq(f, std::make_integer_sequence<int, N>{});
+}
+
+/** TREVC3_COUPLING returns the entry j of the right-hand side of the solve of the rows
+    i0:i1-1 for the eigenvector k (with the rows solved before in Xk):
+    -T(i0+j, i1:k) * Xk(i1:k) (right, k >= i1) or -T(k:i0-1, i0+j)^H * Xk(k:i0-1) (left,
+    k < i0). This is the entry of R from the matrix-matrix product, without the terms with
+    the rows of Xk that are zero for this eigenvector. It stops at the first partial sum
+    that is not finite, starting from the rows next to the block (for a vector that is
+    already not finite, it stops at once). **/
+template <bool LEFT, typename T, typename I>
+__device__ T
+    trevc3_coupling(const T* A, const I ldt, const I i0, const I i1, const I j, const I k, const T* Xk)
+{
+    T s = 0;
+    if(LEFT)
+    {
+        for(I r = i0 - 1; r >= k; r--)
+        {
+            s += conj(A[r + (i0 + j) * size_t(ldt)]) * Xk[r];
+            if(!trevc3_isfinite(s))
+                break;
+        }
+    }
+    else
+    {
+        for(I r = i1; r <= k; r++)
+        {
+            s += A[(i0 + j) + r * size_t(ldt)] * Xk[r];
+            if(!trevc3_isfinite(s))
+                break;
+        }
+    }
+    return -s;
+}
+
+/** TREVC3_PIVOT returns the entry x_j = s / d of an eigenvector, d = t - lambda_k
+    (conjugated if LEFT; replaced by smin if smaller), and sets sc to the factor by which
+    the vector must be scaled first (1 if it need not be) so that x_j stays below xbig.
+    A pivot that is not finite is handled as described in trevc3_solve_kernel. **/
+template <bool LEFT, typename T, typename S>
+__device__ __forceinline__ T trevc3_pivot(T s, const T t, const T lam, const S smin, const S xbig, S& sc)
+{
+    T d = t - lam;
+    if(hqr_cabs1(d) < smin)
+        d = T(smin);
+    if(LEFT)
+        d = conj(d);
+
+    const S as = hqr_cabs1(s);
+    const S ad = hqr_cabs1(d);
+    const bool zpiv = LEFT ? std::isnan(ad) : !trevc3_isfinite(d);
+    sc = 1;
+    if(zpiv || (as > xbig * ad && as <= std::numeric_limits<S>::max()))
+    {
+        sc = zpiv ? S(0) : (xbig * ad) / as;
+        s *= sc;
+        if(zpiv)
+        {
+            // (x_j = s / 1 exactly)
+            s = T(std::min(S(1), xbig));
+            d = T(1);
+        }
+    }
+    return hqr_zladiv(s, d);
+}
+
 /** TREVC3_SOLVE_KERNEL solves the rows i0:i0+nb-1 (0-based; a diagonal block of T)
     of the eigenvectors k = p0:p1-1 that involve them, one thread per eigenvector.
     Right eigenvectors (LEFT = false, rows processed from the bottom): for k >= i0+nb,
@@ -248,7 +342,26 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS)
     coupling with the rows above) is in R; for k in the block, y_k = 1 and the rows
     above it are zero. X (leading dimension n) holds the vectors of the block of
     eigenvectors; the rows solved before (outside this diagonal block) are rescaled
-    if the vector is. **/
+    if the vector is.
+    Entries of T that are not finite: as in ZTREVC3, eigenvector k only involves
+    T(0:k,0:k) (right) or T(k:n-1,k:n-1) (left), so the zero rows of x_k never multiply
+    entries of T (0 * Inf = NaN): when the diagonal block has non-finite entries, the
+    eigenvectors k in the block are solved by a loop over the rows that can be nonzero
+    (with x in X; the products of the unrolled substitution are not restricted, which
+    would slow it down), and the entries of R that are not finite (they can come from
+    such products in the matrix-matrix product) are recomputed without them
+    (trevc3_coupling). Pivots that are not finite are treated as in ZTREVC3 (with the
+    reference ZLATRS): a pivot that is NaN, or for right eigenvectors also Inf (ZLATRS
+    scales it as complex * real, which makes it NaN), is taken as a zero pivot, i.e. x is
+    replaced by the solution of (T - lambda_k I) x = 0 that is 0 in the rows solved before
+    and 1 in the row of the pivot (a scaling by 0, so the entries of x in this diagonal
+    block that are already Inf or NaN become NaN, not 0 as in ZLATRS: selects there would
+    take many more registers); a pivot that is Inf for left eigenvectors divides (giving
+    0), as in ZTRSV. Otherwise, Inf and NaN propagate without rescaling, as in ZTRSV
+    (called by ZLATRS when T has non-finite entries), and the vectors that involve them
+    come out with NaN entries; which entries are NaN, zero or finite can differ from
+    ZTREVC3, e.g. as the reference BLAS skip the products with exact zeros, and IZAMAX
+    takes the first entry when it is NaN. **/
 template <bool LEFT, int NB, int BS, typename T, typename I, typename S, typename U>
 ROCSOLVER_KERNEL void __launch_bounds__(BS) trevc3_solve_kernel(const I n,
                                                                 U TT,
@@ -259,7 +372,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) trevc3_solve_kernel(const I n,
                                                                 const I nb,
                                                                 const I p0,
                                                                 const I p1,
-                                                                const T* RR,
+                                                                T* RR,
                                                                 const rocblas_stride strideR,
                                                                 T* XX,
                                                                 const rocblas_stride strideX,
@@ -267,19 +380,21 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) trevc3_solve_kernel(const I n,
 {
     const I bid = hipBlockIdx_y;
     const T* A = load_ptr_batch<T>(TT, bid, shiftT, strideT);
-    const T* R = RR + bid * strideR;
+    T* R = RR + bid * strideR;
     T* X = XX + bid * strideX;
     const I i1 = i0 + nb;
 
     // diagonal block of T in shared memory (zero outside the nb x nb block)
     __shared__ T Ts[NB * NB];
+    bool tsfin = true;
     for(I e = hipThreadIdx_x; e < NB * NB; e += BS)
     {
         const I c = e / NB;
         const I r = e - c * NB;
         Ts[e] = (r < nb && c < nb) ? A[(i0 + r) + (i0 + c) * size_t(ldt)] : T(0);
+        tsfin = tsfin && trevc3_isfinite(Ts[e]);
     }
-    __syncthreads();
+    const bool tsbad = __syncthreads_or(!tsfin);
 
     // eigenvectors that involve these rows
     const I kbeg = LEFT ? p0 : std::max(i0, p0);
@@ -293,22 +408,76 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) trevc3_solve_kernel(const I n,
     const S smlnum = hqr_safmin<S>() * (S(n) / ulp);
     const S smin = std::max(ulp * hqr_cabs1(lam), smlnum);
     const S xbig = trevc3_xbig(n, tmax_s[bid]);
-    const T* Rk = R + (k - p0) * NB;
+    T* Rk = R + (k - p0) * NB;
     T* Xk = X + (k - p0) * size_t(n);
 
-    // x is indexed only with compile-time constants (fully unrolled loops), so that it stays
-    // in registers; the entries that are known to be zero (outside the block, and below
-    // (right) or above (left) the eigenvalue when k is in the block) take part in the
-    // products and the rescaling as exact zeros, which leaves the results unchanged
     const bool inblk = (k >= i0 && k < i1);
     const I kl = inblk ? k - i0 : 0;
+    S stot = 1;
+    S sc;
+
+    if(inblk && tsbad)
+    {
+        // k in the block, and entries of the block that are not finite: substitution with
+        // the rows kl:0 (right) or kl:nb-1 (left) only, in X (this is the first block of
+        // rows of x_k, so there are no rows solved before)
+        T* xb = Xk + i0;
+        xb[kl] = T(std::min(S(1), xbig));
+        if(LEFT)
+        {
+            for(I j = kl + 1; j < nb; j++)
+            {
+                T s = 0;
+                for(I l = kl; l < j; l++)
+                    s -= conj(Ts[l + j * NB]) * xb[l];
+                const T xj = trevc3_pivot<LEFT>(s, Ts[j + j * NB], lam, smin, xbig, sc);
+                if(sc != S(1))
+                    for(I l = kl; l < j; l++)
+                        xb[l] *= sc;
+                xb[j] = xj;
+            }
+        }
+        else
+        {
+            for(I j = kl - 1; j >= 0; j--)
+            {
+                T s = 0;
+                for(I l = j + 1; l <= kl; l++)
+                    s -= Ts[j + l * NB] * xb[l];
+                const T xj = trevc3_pivot<LEFT>(s, Ts[j + j * NB], lam, smin, xbig, sc);
+                if(sc != S(1))
+                    for(I l = j + 1; l <= kl; l++)
+                        xb[l] *= sc;
+                xb[j] = xj;
+            }
+        }
+        return;
+    }
+
+    // x is indexed only with compile-time constants (unrolled loops), so that it stays
+    // in registers; the entries that are zero (outside the block, and below (right) or
+    // above (left) the eigenvalue when k is in the block) take part in the products as
+    // exact zeros, with zeros of Ts or finite entries of T (see above)
     T x[NB];
+    bool rfin = true;
 #pragma unroll
     for(int j = 0; j < NB; j++)
     {
         if(inblk)
             x[j] = (j == kl) ? T(std::min(S(1), xbig)) : T(0);
         else
+        {
+            x[j] = (j < nb) ? Rk[j] : T(0);
+            rfin = rfin & trevc3_isfinite(x[j]);
+        }
+    }
+    if(!rfin)
+    {
+        for(I j = 0; j < nb; j++)
+            if(!trevc3_isfinite(Rk[j]))
+                Rk[j] = trevc3_coupling<LEFT>(A, ldt, i0, i1, j, k, Xk);
+#pragma unroll
+        for(int j = 0; j < NB; j++)
             x[j] = (j < nb) ? Rk[j] : T(0);
     }
     // rows to solve: jlo:jhi
@@ -316,61 +485,46 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) trevc3_solve_kernel(const I n,
     const I jhi = (!LEFT && inblk) ? kl - 1 : nb - 1;
 
     // substitution, with the entries of x (solved or right-hand side) kept below xbig
-    S stot = 1;
-#pragma unroll
-    for(int jj = 0; jj < NB; jj++)
-    {
-        const int j = LEFT ? jj : NB - 1 - jj;
+    trevc3_unroll<NB>([&](auto jc) {
+        constexpr int j = LEFT ? decltype(jc)::value : NB - 1 - decltype(jc)::value;
         if(j < jlo || j > jhi)
-            continue;
+            return;
         T s = x[j];
-        T d;
         if(LEFT)
         {
 #pragma unroll
             for(int l = 0; l < j; l++)
                 s -= conj(Ts[l + j * NB]) * x[l];
-            d = Ts[j + j * NB] - lam;
-            if(hqr_cabs1(d) < smin)
-                d = T(smin);
-            d = conj(d);
         }
         else
         {
 #pragma unroll
             for(int l = j + 1; l < NB; l++)
                 s -= Ts[j + l * NB] * x[l];
-            d = Ts[j + j * NB] - lam;
-            if(hqr_cabs1(d) < smin)
-                d = T(smin);
         }
-
-        const S as = hqr_cabs1(s);
-        const S ad = hqr_cabs1(d);
-        if(as > xbig * ad)
+        const T xj = trevc3_pivot<LEFT>(s, Ts[j + j * NB], lam, smin, xbig, sc);
+        if(sc != S(1))
         {
-            const S sc = (xbig * ad) / as;
 #pragma unroll
             for(int l = 0; l < NB; l++)
                 x[l] *= sc;
-            s *= sc;
             stot *= sc;
         }
-        x[j] = hqr_zladiv(s, d);
-    }
+        x[j] = xj;
+    });
 
-    // rescale the rows solved before, and store the new ones
+    // rescale the rows solved before (zero them after a zero pivot), and store the new ones
     if(stot != S(1))
     {
         if(LEFT)
         {
             for(I r = std::max(k, p0); r < i0; r++)
-                Xk[r] *= stot;
+                Xk[r] = (stot == 0) ? T(0) : Xk[r] * stot;
         }
         else
         {
             for(I r = i1; r <= k; r++)
-                Xk[r] *= stot;
+                Xk[r] = (stot == 0) ? T(0) : Xk[r] * stot;
         }
     }
 #pragma unroll
