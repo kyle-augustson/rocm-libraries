@@ -45,7 +45,9 @@ typedef std::tuple<vector<int>, vector<char>> trevc3_tuple;
 // mtype = 3: Schur form of a random upper Hessenberg matrix,
 // mtype = 4: bidiagonal T whose last vector reaches the bound of the solve, with Q = 32 *
 //            a reflector (Q x overflows unless the vectors are scaled first),
-// mtype = 5: T with huge off-diagonal entries (the row and column sums overflow)
+// mtype = 5: T with huge off-diagonal entries (the row and column sums overflow),
+// mtype = 6: T with NaN and infinite entries above the diagonal (the vectors that do not
+//            depend on them are checked)
 // (see trevc3_initData)
 
 // each op_range vector is a {side, howmny}
@@ -79,6 +81,10 @@ const vector<vector<int>> matrix_size_range = {
     {64, 64, 70, 4},
     {40, 40, 40, 5},
     {300, 300, 300, 5},
+    // NaN and infinite entries (at positions that depend on the member of the batch)
+    {10, 10, 10, 6},
+    {40, 40, 40, 6},
+    {100, 100, 110, 6},
     // strides larger than ld*n
     {33, 40, 35, 0, 7},
     {100, 100, 100, 3, 7},
@@ -89,6 +95,7 @@ const vector<vector<int>> large_matrix_size_range = {
     {500, 500, 500, 1},
     {600, 600, 600, 2},
     {1000, 1000, 1000, 3},
+    {600, 600, 600, 6},
 };
 
 Arguments trevc3_setup_arguments(trevc3_tuple tup)

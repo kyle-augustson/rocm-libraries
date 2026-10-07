@@ -175,6 +175,149 @@ rocblas_int trevc3_gapsChanged(Th& hRes, Th& h, const size_t used)
     return changed;
 }
 
+/** TREVC3_NONFINITE sets NaN and infinite entries above the diagonal of the n-by-n matrix T
+    of the member b of the batch (class mtype = 6), at positions that depend on b: the top
+    right corner and the middle of the first superdiagonal (b % 3 == 0), the coupling of
+    the first two blocks of 32 rows of the solve and the last column (b % 3 == 1), and an
+    entry next to the diagonal near the top-left corner (b % 3 == 2). **/
+template <typename T>
+void trevc3_nonfinite(const rocblas_int n, T* hT, const rocblas_int ldt, const rocblas_int b)
+{
+    using S = decltype(std::real(T{}));
+    const S nan = std::numeric_limits<S>::quiet_NaN();
+    const S inf = std::numeric_limits<S>::infinity();
+    auto set = [&](const rocblas_int i, const rocblas_int j, const T v) {
+        if(i < j && j < n)
+            hT[i + size_t(j) * ldt] = v;
+    };
+    if(b % 3 == 0)
+    {
+        set(0, n - 1, T(inf, 0));
+        set(n / 2, n / 2 + 1, T(nan, 0));
+    }
+    else if(b % 3 == 1)
+    {
+        set(31, 32, T(0, nan));
+        set(n - 2, n - 1, T(-inf, inf));
+    }
+    else
+        set(2, 3, T(inf, nan));
+}
+
+/** TREVC3_CLEANERROR checks, for the class mtype = 6, the eigenvectors that do not depend on
+    a NaN or an infinite entry of T: the right vector j if T(0:j, 0:j) is finite, the left
+    vector j if T(j:n-1, j:n-1) is finite (they are finite in LAPACK). These must be finite,
+    normalized, with the zero structure of the vectors of a triangular matrix (if howmny =
+    all), and have small residuals on that block (as in trevc3_vectorError). The other
+    vectors are not checked (their entries can be NaN, infinite or finite). **/
+template <typename T>
+double trevc3_cleanError(const bool left,
+                         const bool over,
+                         const rocblas_int n,
+                         std::vector<rocblas_double_complex>& Tu,
+                         T* Q,
+                         T* V,
+                         const rocblas_int ldv,
+                         rocblas_int& nclean)
+{
+    using Z = rocblas_double_complex;
+    auto dbl = [](T z) { return Z(double(std::real(z)), double(std::imag(z))); };
+    auto fin = [](Z z) { return std::isfinite(std::real(z)) && std::isfinite(std::imag(z)); };
+    const size_t nn = size_t(n) * n;
+    auto t = [&](const rocblas_int i, const rocblas_int j) { return Tu[i + size_t(j) * n]; };
+
+    // first column (right vectors) / last row (left vectors) reached by a non-finite entry
+    rocblas_int jbad = n, ibad = -1;
+    for(rocblas_int j = 0; j < n; j++)
+        for(rocblas_int i = 0; i <= j; i++)
+            if(!fin(t(i, j)))
+            {
+                jbad = std::min(jbad, j);
+                ibad = std::max(ibad, i);
+            }
+
+    // X = V, or X = Q^H V
+    std::vector<Z> X(nn), R(nn);
+    for(rocblas_int j = 0; j < n; j++)
+        for(rocblas_int i = 0; i < n; i++)
+            R[i + size_t(j) * n] = dbl(V[i + size_t(j) * ldv]);
+    if(over)
+    {
+        std::vector<Z> Qd(nn);
+        for(size_t k = 0; k < nn; k++)
+            Qd[k] = dbl(Q[k]);
+        cpu_gemm(rocblas_operation_conjugate_transpose, rocblas_operation_none, n, n, n, Z(1),
+                 Qd.data(), n, R.data(), n, Z(0), X.data(), n);
+    }
+    else
+        X = R;
+
+    double err = 0;
+    nclean = 0;
+    for(rocblas_int j = 0; j < n; j++)
+    {
+        // the block of T of the vector j: rows and columns lo:hi
+        const rocblas_int lo = left ? j : 0, hi = left ? n - 1 : j;
+        if(left ? (j <= ibad) : (j >= jbad))
+            continue;
+        nclean++;
+
+        // normalization (of V) and zero structure
+        double vmax = 0;
+        for(rocblas_int i = 0; i < n; i++)
+        {
+            const T v = V[i + size_t(j) * ldv];
+            const double a = std::abs(double(std::real(v))) + std::abs(double(std::imag(v)));
+            if(std::isnan(a) || a > vmax)
+                vmax = a;
+            if(!over && (i < lo || i > hi) && !(v == T(0)))
+                err = 1;
+        }
+        if(!std::isfinite(vmax))
+        {
+            err = 1;
+            continue;
+        }
+        err = std::max(err, std::abs(vmax - 1));
+
+        // residual on the block (and the entries of X outside it, which are rounding errors
+        // of Q^H V if over)
+        double tnorm = 0;
+        for(rocblas_int k = lo; k <= hi; k++)
+            for(rocblas_int i = lo; i <= k; i++)
+                tnorm += std::norm(t(i, k));
+        tnorm = std::max(1.0, std::sqrt(tnorm));
+        const Z lambda = left ? std::conj(t(j, j)) : t(j, j);
+        double rnorm = 0, xnorm = 0;
+        for(rocblas_int i = 0; i < n; i++)
+            xnorm += std::norm(X[i + size_t(j) * n]);
+        for(rocblas_int i = 0; i < n; i++)
+        {
+            Z r = 0;
+            if(i < lo || i > hi)
+                r = X[i + size_t(j) * n] * tnorm;
+            else
+            {
+                // (T x)_i = sum T(i,k) x_k over k = i:hi, (T^H y)_i = sum conj(T(k,i)) y_k over
+                // k = lo:i
+                if(left)
+                    for(rocblas_int k = lo; k <= i; k++)
+                        r += std::conj(t(k, i)) * X[k + size_t(j) * n];
+                else
+                    for(rocblas_int k = i; k <= hi; k++)
+                        r += t(i, k) * X[k + size_t(j) * n];
+                r -= lambda * X[i + size_t(j) * n];
+            }
+            rnorm += std::norm(r);
+        }
+        if(xnorm == 0 || !std::isfinite(xnorm) || !std::isfinite(rnorm))
+            err = 1;
+        else
+            err = std::max(err, std::sqrt(rnorm) / (tnorm * std::sqrt(xnorm)));
+    }
+    return err;
+}
+
 /** TREVC3_INITDATA generates an n-by-n upper triangular matrix T according to mtype:
     - mtype = 0: random T (normally distributed entries).
     - mtype = 1: clustered diagonal, T(j,j) = 1 + 1e-3 * random (strong growth in the
@@ -186,6 +329,8 @@ rocblas_int trevc3_gapsChanged(Th& hRes, Th& h, const size_t used)
                  32 times a reflector whose first row is (1, ..., 1) / sqrt(n): the vector of
                  the last eigenvalue reaches the bound of the solve, and Q x overflows unless
                  the vectors are scaled before the back-transformation.
+    - mtype = 6: random T with NaN and infinite entries above the diagonal (see
+                 trevc3_nonfinite).
     - mtype = 5: off-diagonal entries of size about huge/8, and T(0,1) = (0.75, 0.75) * huge
                  (|Re| + |Im| of T(0,1), and the row and column sums, overflow).
     The entries below the diagonal of T (and in the padding) are random garbage, as they must
@@ -293,6 +438,9 @@ void trevc3_initData(const rocblas_handle handle,
                     for(size_t k = 0; k < nn; k++)
                         Q[k] = Z[k];
             }
+
+            if(mtype == 6)
+                trevc3_nonfinite(n, hT[b], ldt, b);
 
             if(over && mtype == 4)
             {
@@ -488,19 +636,20 @@ void trevc3_getError(const rocblas_handle handle,
     *max_err = 0;
     for(rocblas_int b = 0; b < bc; ++b)
     {
-        for(size_t k = 0; k < size_t(ldt) * n; k++)
-            if(!(hTRes[b][k] == hT[b][k]))
-                *max_err = 1;
+        // (bitwise, as T may have NaN entries)
+        if(memcmp(hTRes[b], hT[b], sizeof(T) * size_t(ldt) * n) != 0)
+            *max_err = 1;
 
-        // Tu = T / 2^e (exact), with 2^e >= max(|Re|, |Im|) of the entries of T, so that the
-        // check neither overflows nor underflows (the residuals are relative)
+        // Tu = T / 2^e (exact), with 2^e >= max(|Re|, |Im|) of the (finite) entries of T, so
+        // that the check neither overflows nor underflows (the residuals are relative)
         double amax = 0;
         for(rocblas_int j = 0; j < n; j++)
             for(rocblas_int i = 0; i <= j; i++)
             {
                 const T t = hT[b][i + size_t(j) * ldt];
-                amax = std::max(
-                    {amax, std::abs(double(std::real(t))), std::abs(double(std::imag(t)))});
+                for(const double a : {std::abs(double(std::real(t))), std::abs(double(std::imag(t)))})
+                    if(std::isfinite(a))
+                        amax = std::max(amax, a);
             }
         int e = 0;
         if(amax > 0 && std::isfinite(amax))
@@ -546,6 +695,24 @@ void trevc3_getError(const rocblas_handle handle,
         }
 
         T* Q = over ? hQ.data() + nn * b : nullptr;
+        if(mtype == 6)
+        {
+            // NaN and infinite entries: only the vectors that do not depend on them
+            rocblas_int nclean;
+            for(const bool left : {false, true})
+            {
+                if(left ? !leftv : !rightv)
+                    continue;
+                err = left ? trevc3_cleanError(true, over, n, Tu, Q, hVLRes[b], ldvl, nclean)
+                           : trevc3_cleanError(false, over, n, Tu, Q, hVRRes[b], ldvr, nclean);
+                *max_err = err > *max_err ? err : *max_err;
+                // (some vectors must be checked)
+                EXPECT_GT(nclean, 0) << "where b = " << b;
+                if(n > 3 && nclean == 0)
+                    *max_err = 1;
+            }
+            continue;
+        }
         if(rightv)
         {
             err = trevc3_vectorError(false, over, n, Tu, normT, Q, hVRRes[b], ldvr);
