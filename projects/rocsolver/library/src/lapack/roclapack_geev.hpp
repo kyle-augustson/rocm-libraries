@@ -226,19 +226,23 @@ ROCSOLVER_KERNEL void geev_copy_kernel(const I n,
 
 /** GEEV_NORMALIZE_KERNEL normalizes each column of V as in ZGEEV: to Euclidean norm 1,
     and then multiplied by the complex sign that makes its entry of largest
-    |Re|^2 + |Im|^2 (the first one, if there are several) real. **/
+    |Re|^2 + |Im|^2 (the first one, if there are several) real. The matrices with
+    info > 0 are skipped. **/
 template <int BS, typename T, typename I, typename U>
 ROCSOLVER_KERNEL void __launch_bounds__(BS) geev_normalize_kernel(const I n,
                                                                   U VV,
                                                                   const rocblas_stride shiftV,
                                                                   const I ldv,
-                                                                  const rocblas_stride strideV)
+                                                                  const rocblas_stride strideV,
+                                                                  const I* infoA)
 {
     using S = decltype(std::real(T{}));
 
     const I j = hipBlockIdx_x;
     const I bid = hipBlockIdx_y;
     const I tid = hipThreadIdx_x;
+    if(infoA[bid] > 0)
+        return;
     T* v = load_ptr_batch<T>(VV, bid, shiftV, strideV) + j * size_t(ldv);
     __shared__ S sval[BS];
     __shared__ I sidx[BS];
@@ -574,6 +578,10 @@ rocblas_status rocsolver_geev_template(rocblas_handle handle,
         // (clamped to 1 <= ilo <= ihi <= n, as in HSEQR)
         hilo[b] = std::min(std::max(hilo[b], I(1)), n);
         hihi[b] = std::min(std::max(hihi[b], hilo[b]), n);
+        // (with ilo = ihi, the reduction does nothing and Q = I, whatever ilo is: these
+        // matrices are reduced together, with the range 1:1)
+        if(hilo[b] == hihi[b])
+            hilo[b] = hihi[b] = 1;
         uniform = uniform && hilo[b] == hilo[0] && hihi[b] == hihi[0];
     }
 
@@ -695,31 +703,53 @@ rocblas_status rocsolver_geev_template(rocblas_handle handle,
             ROCSOLVER_LAUNCH_KERNEL((geev_copy_kernel<T>), grid2, threads2, 0, stream, n, VL, shiftVL,
                                     ldvl, strideVL, VR, shiftVR, ldvr, strideVR, true, false);
 
-        // eigenvectors of the Schur form, back-transformed
-        const rocblas_side side = leftv && rightv ? rocblas_side_both
-            : leftv                               ? rocblas_side_left
-                                                  : rocblas_side_right;
-        ROCBLAS_CHECK(rocsolver_trevc3_template<BATCHED, STRIDED, T>(
-            handle, side, rocsolver_eigenvectors_backtransform, n, A, shiftA, lda, strideA, VL,
-            shiftVL, ldvl, strideVL, VR, shiftVR, ldvr, strideVR, batch_count, (T*)work1, (T*)work2,
-            (T*)work3, work4, (T**)work5));
-
-        // undo the balancing, and normalize
-        if(leftv)
+        // As in ZGEEV, no eigenvectors are computed if HSEQR failed (info > 0). For a single
+        // matrix, info is read back (a synchronization) and the remaining stages are skipped:
+        // VL and VR are left with the Schur vectors computed by HSEQR, as in LAPACK. In a batch,
+        // TREVC3 still runs for all the matrices, but GEBAK and the normalization skip those
+        // with info > 0, whose VL and VR are left with the back-transformed eigenvectors of
+        // their partial Schur form (in both cases, the documented contents are undefined).
+        bool failed = false;
+        if(batch_count == 1)
         {
-            ROCBLAS_CHECK(rocsolver_gebak_template<BATCHED, STRIDED, T>(
-                handle, rocsolver_balance_both, rocblas_side_left, n, (const I*)ilo, (const I*)ihi,
-                (const S*)scaleS, strideS, n, VL, shiftVL, ldvl, strideVL, batch_count));
-            ROCSOLVER_LAUNCH_KERNEL((geev_normalize_kernel<BS1, T>), dim3(n, batch_count),
-                                    dim3(BS1), 0, stream, n, VL, shiftVL, ldvl, strideVL);
+            I hinfo = 0;
+            HIP_CHECK(hipMemcpyAsync(&hinfo, info, sizeof(I), hipMemcpyDeviceToHost, stream));
+            HIP_CHECK(hipStreamSynchronize(stream));
+            failed = hinfo > 0;
         }
-        if(rightv)
+
+        if(!failed)
         {
-            ROCBLAS_CHECK(rocsolver_gebak_template<BATCHED, STRIDED, T>(
-                handle, rocsolver_balance_both, rocblas_side_right, n, (const I*)ilo, (const I*)ihi,
-                (const S*)scaleS, strideS, n, VR, shiftVR, ldvr, strideVR, batch_count));
-            ROCSOLVER_LAUNCH_KERNEL((geev_normalize_kernel<BS1, T>), dim3(n, batch_count),
-                                    dim3(BS1), 0, stream, n, VR, shiftVR, ldvr, strideVR);
+            // eigenvectors of the Schur form, back-transformed
+            const rocblas_side side = leftv && rightv ? rocblas_side_both
+                : leftv                               ? rocblas_side_left
+                                                      : rocblas_side_right;
+            ROCBLAS_CHECK(rocsolver_trevc3_template<BATCHED, STRIDED, T>(
+                handle, side, rocsolver_eigenvectors_backtransform, n, A, shiftA, lda, strideA, VL,
+                shiftVL, ldvl, strideVL, VR, shiftVR, ldvr, strideVR, batch_count, (T*)work1,
+                (T*)work2, (T*)work3, work4, (T**)work5));
+
+            // undo the balancing, and normalize
+            if(leftv)
+            {
+                ROCBLAS_CHECK(rocsolver_gebak_template<BATCHED, STRIDED, T>(
+                    handle, rocsolver_balance_both, rocblas_side_left, n, (const I*)ilo,
+                    (const I*)ihi, (const S*)scaleS, strideS, n, VL, shiftVL, ldvl, strideVL,
+                    batch_count, (const I*)info));
+                ROCSOLVER_LAUNCH_KERNEL((geev_normalize_kernel<BS1, T>), dim3(n, batch_count),
+                                        dim3(BS1), 0, stream, n, VL, shiftVL, ldvl, strideVL,
+                                        (const I*)info);
+            }
+            if(rightv)
+            {
+                ROCBLAS_CHECK(rocsolver_gebak_template<BATCHED, STRIDED, T>(
+                    handle, rocsolver_balance_both, rocblas_side_right, n, (const I*)ilo,
+                    (const I*)ihi, (const S*)scaleS, strideS, n, VR, shiftVR, ldvr, strideVR,
+                    batch_count, (const I*)info));
+                ROCSOLVER_LAUNCH_KERNEL((geev_normalize_kernel<BS1, T>), dim3(n, batch_count),
+                                        dim3(BS1), 0, stream, n, VR, shiftVR, ldvr, strideVR,
+                                        (const I*)info);
+            }
         }
     }
 
