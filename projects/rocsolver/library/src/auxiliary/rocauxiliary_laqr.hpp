@@ -730,8 +730,11 @@ __device__ void hqr_laqr1(const int nn, const T* H, const I ldh, const T s1, con
       arrives: a full fence would also write back the L2 cache of its XCD, which is slow when it
       holds many modified lines (for example of the matrix products on the side stream).
     - Elsewhere: bar[0] counts the arrivals of the current barrier (the last one sets it back to
-      0) and bar[1] is the generation, with full fences. (The scheme above relies on the
-      gfx94x fences; on gfx11, for example, thread-blocks could read data of the previous step.)
+      0) and bar[1] is the generation. Every thread releases its writes (a full fence) before
+      the thread-block arrives, as a barrier of the thread-block alone does not wait for the
+      global memory writes of the other wavefronts (on gfx90a, for example). (The scheme above
+      relies on the gfx94x fences; on gfx11, for example, thread-blocks could read data of the
+      previous step.)
       **/
 __device__ inline void laqr5_grid_barrier(unsigned* bar, const unsigned G)
 {
@@ -757,6 +760,7 @@ __device__ inline void laqr5_grid_barrier(unsigned* bar, const unsigned G)
     }
     __syncthreads();
 #else
+    __threadfence();
     __syncthreads();
     if(hipThreadIdx_x == 0)
     {
@@ -779,6 +783,37 @@ __device__ inline void laqr5_grid_barrier(unsigned* bar, const unsigned G)
     }
     __syncthreads();
 #endif
+}
+
+/** LAQR5_CORESIDENT is called by thread 0 of each of the G thread-blocks of a launch that
+    synchronizes with laqr5_grid_barrier, before any work: the blocks must all be resident, which
+    a normal launch does not guarantee (for example with other processes on the device, or on a
+    stream with a CU mask). The first block to arrive waits up to LAQR5_CORESIDENT_TICKS ticks of
+    the constant-rate clock for the others, then decides: 1 if they all arrived (they all go on),
+    else 0 (it does the work alone, as a launch of one thread-block, and the others return -1 and
+    stop). hs[0] counts the arrivals and hs[1] holds the decision; both are 0 before the launch. **/
+#ifndef LAQR5_CORESIDENT_TICKS
+#define LAQR5_CORESIDENT_TICKS 2500000 // (25 ms at 100 MHz)
+#endif
+__device__ inline int laqr5_coresident(unsigned* hs, const unsigned G)
+{
+    const unsigned a = __hip_atomic_fetch_add(hs, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if(a == 0)
+    {
+        const uint64_t t0 = wall_clock64();
+        while(__hip_atomic_load(hs, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < G
+              && wall_clock64() - t0 < uint64_t(LAQR5_CORESIDENT_TICKS))
+            __builtin_amdgcn_s_sleep(1);
+        // (the decision is taken once: the blocks that arrive later only read it)
+        const unsigned d
+            = (__hip_atomic_load(hs, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) >= G) ? 1u : 2u;
+        __hip_atomic_store(hs + 1, d, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        return d == 1 ? 1 : 0;
+    }
+    unsigned d;
+    while((d = __hip_atomic_load(hs + 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT)) == 0)
+        __builtin_amdgcn_s_sleep(1);
+    return d == 1 ? 1 : -1;
 }
 
 /*

@@ -467,8 +467,25 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) laqr5_chunk_kernel(const bool wantt,
                                                                unsigned* bar)
 {
     __shared__ T sV[HSEQR_MAX_SHIFTS / 2 + 2][3];
+    I G = I(hipGridDim_x), blk = I(hipBlockIdx_x);
+    if(G > 1)
+    {
+        // (all the thread-blocks must be resident for the grid barriers; if they are not, the
+        // first one does the chunk alone, see laqr5_coresident)
+        __shared__ int s_role;
+        if(hipThreadIdx_x == 0)
+            s_role = laqr5_coresident(bar + 2, unsigned(G));
+        __syncthreads();
+        if(s_role < 0)
+            return;
+        if(s_role == 0)
+        {
+            G = 1;
+            blk = 0;
+        }
+    }
     laqr5_chunk_block<BS>(wantt, wantz, accum, n, ktop, kbot, nbmps, incol, sh, H, ldh, iloz, ihiz,
-                          Z, ldz, Vbuf, sV, I(hipGridDim_x), I(hipBlockIdx_x), bar);
+                          Z, ldz, Vbuf, sV, G, blk, bar);
 }
 
 /** LAQR5_BUILD_U_KERNEL forms U from the stored reflections (laqr5_build_u_block), each
@@ -683,6 +700,9 @@ I hseqr_aed_window_cap(const I nh, const bool hybrid)
 ROCSOLVER_KERNEL void hseqr_reset_barrier_kernel(unsigned* bar)
 {
     __hip_atomic_store(bar, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    // (and the co-residency check, see laqr5_coresident)
+    __hip_atomic_store(bar + 2, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __hip_atomic_store(bar + 3, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 /** HSEQR_MULTISHIFT computes the Schur form of one Hessenberg matrix with the
