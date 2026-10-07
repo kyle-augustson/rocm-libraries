@@ -227,7 +227,6 @@ rocblas_status rocsolver_larfb_template(rocblas_handle handle,
     rocblas_operation transp;
     rocblas_fill uploV, uploT;
     rocblas_int order, ldw;
-    rocblas_stride shift1, shift2;
     size_t offsetA1, offsetA2;
     size_t offsetV1, offsetV2;
 
@@ -500,7 +499,6 @@ rocblas_status rocsolver_larfb_inverse_template(rocblas_handle handle,
     rocblas_operation transp;
     rocblas_fill uploV, uploT;
     rocblas_int order, ldw;
-    rocblas_stride shift1, shift2;
     size_t offsetA1, offsetA2;
     size_t offsetV1, offsetV2;
 
