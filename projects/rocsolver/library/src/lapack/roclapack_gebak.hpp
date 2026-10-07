@@ -37,9 +37,10 @@
 
 ROCSOLVER_BEGIN_NAMESPACE
 
-// thread-block size of gebak_gather_kernel, number of rows per thread (so that it is used
-// for n <= GEBAK_GATHER_THDS * GEBAK_GATHER_ROWS), and number of columns of each matrix
-// that it permutes at a time
+// thread-block size of gebak_gather_kernel, number of rows per thread (so that the
+// swaps are composed at once for n <= GEBAK_GATHER_THDS * GEBAK_GATHER_ROWS, and in
+// segments of GEBAK_GATHER_THDS * GEBAK_GATHER_ROWS / 2 swaps for larger n), and number
+// of columns of each matrix that it permutes at a time
 #ifndef GEBAK_GATHER_THDS
 #define GEBAK_GATHER_THDS 1024
 #endif
@@ -86,59 +87,26 @@ ROCSOLVER_KERNEL void gebak_scale_kernel(const rocblas_side side,
     V[idx2D(i, j, ldv)] *= s;
 }
 
-/** GEBAK_PERMUTE_KERNEL undoes the permutations recorded in scale, in the same
-    order as LAPACK: rows ilo-2 down to 0, then rows ihi to n-1. The swaps must be
-    applied sequentially, but the columns of V are independent; each thread
-    processes one column (used when n is too large for gebak_gather_kernel).
+/** GEBAK_GATHER_KERNEL undoes the permutations recorded in scale, in the same order
+    as LAPACK: rows ilo-2 down to 0, then rows ihi to n-1 are swapped with rows
+    scale(i)-1 (an invalid index means no swap). As V is permuted by the swaps s_1, ...,
+    s_K in this order, the row r of the result is the row perm(r) = s_1(s_2(...s_K(r)))
+    of V, so the swaps are composed by following the rows through them in reverse order
+    (rows n-1 down to ihi, then rows 0 to ilo-2, staged in shared memory).
+    If SEG is false, each thread (x, y) owns the rows r = x + k * blockDim.x, k < ROWS,
+    and all the swaps are composed at once. If SEG is true (for any n), the swaps are
+    instead applied in segments of up to L = blockDim.x * ROWS / 2 consecutive swaps,
+    starting from s_K. A segment only moves the at most 2L rows i and scale(i)-1 of its
+    swaps, so each thread owns the entries e = x + k * blockDim.x of the list of these
+    rows (first the rows i, which are consecutive, for coalesced stores, then the rows
+    scale(i)-1; a row that is repeated is owned by its first entry only).
+    Then, for the columns j = blockIdx.x * blockDim.y + y + l * ncols, ncols = gridDim.x
+    * blockDim.y, it loads the rows perm(r) that move, and, after a barrier, stores them
+    as rows r (threads along the rows, for coalesced accesses).
     Matrices with infoA > 0 (if infoA is not null) are skipped.
-    Call with a 1D grid over the columns of V, and the batch in y. **/
-template <typename T, typename I, typename S, typename U>
-ROCSOLVER_KERNEL void gebak_permute_kernel(const I n,
-                                           const I m,
-                                           const I* iloA,
-                                           const I* ihiA,
-                                           const S* scaleA,
-                                           const rocblas_stride strideS,
-                                           U VV,
-                                           const rocblas_stride shiftV,
-                                           const I ldv,
-                                           const rocblas_stride strideV,
-                                           const I* infoA)
-{
-    const I bid = hipBlockIdx_y;
-    const I j = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
-    if(j >= m || (infoA && infoA[bid] > 0))
-        return;
-
-    const I ilo = iloA[bid];
-    const I ihi = ihiA[bid];
-    const S* scale = scaleA + bid * strideS;
-    T* V = load_ptr_batch<T>(VV, bid, shiftV, strideV);
-
-    auto swap_rows = [&](const I i) {
-        const I p = static_cast<I>(scale[i]) - 1;
-        if(p != i && p >= 0 && p < n)
-            swap(V[idx2D(i, j, ldv)], V[idx2D(p, j, ldv)]);
-    };
-
-    for(I i = std::min(ilo - 1, n) - 1; i >= 0; i--)
-        swap_rows(i);
-    for(I i = std::max(ihi, I(0)); i < n; i++)
-        swap_rows(i);
-}
-
-/** GEBAK_GATHER_KERNEL applies the same swaps as gebak_permute_kernel, composed
-    into one permutation: as V is permuted by the swaps s_1, ..., s_K in this order,
-    the row r of the result is the row perm(r) = s_1(s_2(...s_K(r))) of V. Each thread
-    (x, y) owns the rows r = x + k * blockDim.x, k < ROWS, and first follows them through
-    the swaps in reverse order (rows n-1 down to ihi, then rows 0 to ilo-2, staged in
-    shared memory). Then, for the columns j = blockIdx.x * blockDim.y + y + l * ncols,
-    ncols = gridDim.x * blockDim.y, it loads the rows perm(r) that move, and, after a
-    barrier, stores them as rows r (threads along the rows, for coalesced accesses).
-    Matrices with infoA > 0 (if infoA is not null) are skipped.
-    Call with blockDim.x * blockDim.y <= GEBAK_GATHER_THDS, n <= blockDim.x * ROWS,
-    and the batch in y. **/
-template <int ROWS, typename T, typename I, typename S, typename U>
+    Call with blockDim.x * blockDim.y <= GEBAK_GATHER_THDS, n <= blockDim.x * ROWS
+    if SEG is false, and the batch in y. **/
+template <int ROWS, bool SEG, typename T, typename I, typename S, typename U>
 ROCSOLVER_KERNEL void __launch_bounds__(GEBAK_GATHER_THDS)
     gebak_gather_kernel(const I n,
                         const I m,
@@ -167,7 +135,8 @@ ROCSOLVER_KERNEL void __launch_bounds__(GEBAK_GATHER_THDS)
     const I ihi = ihiA[bid];
     const I nb = n - std::min(std::max(ihi, I(0)), n);
     const I na = std::max(std::min(ilo - 1, n), I(0));
-    if(nb + na == 0)
+    const I ns = nb + na;
+    if(ns == 0)
         return;
 
     const S* scale = scaleA + bid * strideS;
@@ -175,66 +144,126 @@ ROCSOLVER_KERNEL void __launch_bounds__(GEBAK_GATHER_THDS)
     __shared__ I si[GEBAK_GATHER_THDS];
     __shared__ I sp[GEBAK_GATHER_THDS];
 
-    // compose the swaps (an invalid index means no swap, as in gebak_permute_kernel)
-    I q[ROWS];
-#pragma unroll
-    for(int k = 0; k < ROWS; k++)
-        q[k] = tx + k * dimx;
-    for(I t0 = 0; t0 < nb + na; t0 += nt)
-    {
-        const I t = t0 + tid;
-        if(t < nb + na)
-        {
-            const I i = (t < nb) ? n - 1 - t : t - nb;
-            const I p = static_cast<I>(scale[i]) - 1;
-            si[tid] = i;
-            sp[tid] = (p >= 0 && p < n) ? p : i;
-        }
-        __syncthreads();
+    // the row of the t-th swap in reverse order, and the row it is swapped with
+    auto swap_row = [&](const I t) { return (t < nb) ? n - 1 - t : t - nb; };
+    auto swap_with = [&](const I i) {
+        const I p = static_cast<I>(scale[i]) - 1;
+        return (p >= 0 && p < n) ? p : i;
+    };
 
-        const I tn = std::min(nt, nb + na - t0);
-        for(I l = 0; l < tn; l++)
+    // the swaps t0:t1-1 of each segment, from the last segment to the first (all the
+    // threads of the block go through the loops the same number of times)
+    const I ncols = hipGridDim_x * hipBlockDim_y;
+    const I nseg = SEG ? (dimx * ROWS) / 2 : ns;
+    for(I t1 = ns; t1 > 0; t1 -= nseg)
+    {
+        const I t0 = std::max(t1 - nseg, I(0));
+        const I len = t1 - t0;
+
+        // with SEG, the rows i of the segment are n-1-t for t0 <= t < tb, and t-nb for
+        // tb <= t < t1, so that a row can be compared with all of them at once
+        const I tb = std::min(std::max(nb, t0), t1);
+        auto in_rows_i = [&](const I x, const bool top) {
+            return (x >= n - tb && x < n - t0) || (top && x >= tb - nb && x < t1 - nb);
+        };
+
+        // rows r owned by the thread (-1 if none with SEG; rows r >= n are never swapped, so
+        // that q = r for them), and the rows q = perm(r). With SEG, the swap u = t - t0 of
+        // the segment has the entries u and len + u, and an entry is dropped if a smaller one
+        // has the same row: the rows i can only repeat if the ranges of rows 0:ilo-2 and
+        // ihi:n-1 overlap, and the rows scale(i)-1 are first compared with the rows i
+        I r[ROWS], q[ROWS];
+#pragma unroll
+        for(int k = 0; k < ROWS; k++)
         {
-            const I i = si[l];
-            const I p = sp[l];
+            const I e = tx + k * dimx;
+            if constexpr(SEG)
+            {
+                if(e < len)
+                {
+                    r[k] = swap_row(t0 + e);
+                    if(t0 + e >= tb && in_rows_i(r[k], false))
+                        r[k] = -1;
+                }
+                else if(e < 2 * len)
+                {
+                    r[k] = swap_with(swap_row(t0 + e - len));
+                    if(in_rows_i(r[k], true))
+                        r[k] = -1;
+                }
+                else
+                    r[k] = -1;
+            }
+            else
+                r[k] = e;
+            q[k] = r[k];
+        }
+
+        // compose the swaps (and, with SEG, drop the entries len + u whose row scale(i)-1
+        // is also the row of a smaller entry len + u')
+        for(I c0 = t0; c0 < t1; c0 += nt)
+        {
+            const I t = c0 + tid;
+            if(t < t1)
+            {
+                const I i = swap_row(t);
+                si[tid] = i;
+                sp[tid] = swap_with(i);
+            }
+            __syncthreads();
+
+            // (the swap l of the chunk has the entry len + c0 - t0 + l, which comes before the
+            // entry tx + k * dimx if l < el + k * dimx; these are bounded by the number of
+            // entries, so that 32 bits are enough and spare registers with 64-bit integers)
+            const int tn = static_cast<int>(std::min(nt, t1 - c0));
+            const int el = static_cast<int>(tx - len - (c0 - t0));
+            for(int l = 0; l < tn; l++)
+            {
+                const I i = si[l];
+                const I p = sp[l];
+#pragma unroll
+                for(int k = 0; k < ROWS; k++)
+                {
+                    q[k] = (q[k] == i) ? p : (q[k] == p ? i : q[k]);
+                    if constexpr(SEG)
+                    {
+                        if(p == r[k] && l < el + k * static_cast<int>(dimx))
+                            r[k] = -1;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        // permute the columns (the real and imaginary parts are kept apart, so that they
+        // stay in registers; the barrier at the start of the next segment orders its loads
+        // after these stores)
+        S vr[ROWS], vi[ROWS];
+        for(I j0 = hipBlockIdx_x * hipBlockDim_y; j0 < m; j0 += ncols)
+        {
+            const I j = j0 + ty;
 #pragma unroll
             for(int k = 0; k < ROWS; k++)
-                q[k] = (q[k] == i) ? p : (q[k] == p ? i : q[k]);
-        }
-        __syncthreads();
-    }
-
-    // permute the columns (all the threads of the block go through the loop the same
-    // number of times; the real and imaginary parts are kept apart, so that they stay in
-    // registers)
-    const I ncols = hipGridDim_x * hipBlockDim_y;
-    S vr[ROWS], vi[ROWS];
-    for(I j0 = hipBlockIdx_x * hipBlockDim_y; j0 < m; j0 += ncols)
-    {
-        const I j = j0 + ty;
-#pragma unroll
-        for(int k = 0; k < ROWS; k++)
-        {
-            const I r = tx + k * dimx;
-            if(j < m && r < n && q[k] != r)
             {
-                const T x = V[idx2D(q[k], j, ldv)];
-                vr[k] = std::real(x);
-                vi[k] = std::imag(x);
+                if(j < m && q[k] != r[k] && (!SEG || r[k] >= 0))
+                {
+                    const T x = V[idx2D(q[k], j, ldv)];
+                    vr[k] = std::real(x);
+                    vi[k] = std::imag(x);
+                }
             }
-        }
-        __syncthreads();
+            __syncthreads();
 
 #pragma unroll
-        for(int k = 0; k < ROWS; k++)
-        {
-            const I r = tx + k * dimx;
-            if(j < m && r < n && q[k] != r)
+            for(int k = 0; k < ROWS; k++)
             {
-                if constexpr(rocblas_is_complex<T>)
-                    V[idx2D(r, j, ldv)] = T(vr[k], vi[k]);
-                else
-                    V[idx2D(r, j, ldv)] = vr[k];
+                if(j < m && q[k] != r[k] && (!SEG || r[k] >= 0))
+                {
+                    if constexpr(rocblas_is_complex<T>)
+                        V[idx2D(r[k], j, ldv)] = T(vr[k], vi[k]);
+                    else
+                        V[idx2D(r[k], j, ldv)] = vr[k];
+                }
             }
         }
     }
@@ -319,33 +348,28 @@ rocblas_status rocsolver_gebak_template(rocblas_handle handle,
     // backward permutation
     if(job == rocsolver_balance_permute || job == rocsolver_balance_both)
     {
-        if(n <= I(GEBAK_GATHER_THDS) * GEBAK_GATHER_ROWS)
-        {
-            // threads along the rows: the smallest power of 2 that is at least n, or at least
-            // 32 with n <= tx * rows, for rows = 4 or GEBAK_GATHER_ROWS; the other threads of
-            // the block (up to GEBAK_GATHER_THDS) along the columns
-            I tx = 1, ty = 1;
-            while(tx < GEBAK_GATHER_THDS && tx < n && (tx < 32 || tx * 4 < n))
-                tx *= 2;
-            while(tx * ty < GEBAK_GATHER_THDS && ty < m)
-                ty *= 2;
-            const I blocks = (std::min(m, I(GEBAK_GATHER_COLS)) - 1) / ty + 1;
-            if(n <= tx * 4)
-                ROCSOLVER_LAUNCH_KERNEL((gebak_gather_kernel<4, T>), dim3(blocks, batch_count),
-                                        dim3(tx, ty), 0, stream, n, m, ilo, ihi, scale, strideS, V,
-                                        shiftV, ldv, strideV, info);
-            else
-                ROCSOLVER_LAUNCH_KERNEL((gebak_gather_kernel<GEBAK_GATHER_ROWS, T>),
-                                        dim3(blocks, batch_count), dim3(tx, ty), 0, stream, n, m,
-                                        ilo, ihi, scale, strideS, V, shiftV, ldv, strideV, info);
-        }
+        // threads along the rows: the smallest power of 2 that is at least n, or at least 32
+        // with n <= tx * rows, for rows = 4 or GEBAK_GATHER_ROWS (GEBAK_GATHER_THDS for
+        // larger n, which then uses segments); the other threads of the block (up to
+        // GEBAK_GATHER_THDS) along the columns
+        I tx = 1, ty = 1;
+        while(tx < GEBAK_GATHER_THDS && tx < n && (tx < 32 || tx * 4 < n))
+            tx *= 2;
+        while(tx * ty < GEBAK_GATHER_THDS && ty < m)
+            ty *= 2;
+        const I blocks = (std::min(m, I(GEBAK_GATHER_COLS)) - 1) / ty + 1;
+        if(n <= tx * 4)
+            ROCSOLVER_LAUNCH_KERNEL((gebak_gather_kernel<4, false, T>), dim3(blocks, batch_count),
+                                    dim3(tx, ty), 0, stream, n, m, ilo, ihi, scale, strideS, V,
+                                    shiftV, ldv, strideV, info);
+        else if(n <= tx * GEBAK_GATHER_ROWS)
+            ROCSOLVER_LAUNCH_KERNEL((gebak_gather_kernel<GEBAK_GATHER_ROWS, false, T>),
+                                    dim3(blocks, batch_count), dim3(tx, ty), 0, stream, n, m, ilo,
+                                    ihi, scale, strideS, V, shiftV, ldv, strideV, info);
         else
-        {
-            const I blocks = (m - 1) / BS1 + 1;
-            ROCSOLVER_LAUNCH_KERNEL((gebak_permute_kernel<T>), dim3(blocks, batch_count), dim3(BS1),
-                                    0, stream, n, m, ilo, ihi, scale, strideS, V, shiftV, ldv,
-                                    strideV, info);
-        }
+            ROCSOLVER_LAUNCH_KERNEL((gebak_gather_kernel<GEBAK_GATHER_ROWS, true, T>),
+                                    dim3(blocks, batch_count), dim3(tx, ty), 0, stream, n, m, ilo,
+                                    ihi, scale, strideS, V, shiftV, ldv, strideV, info);
     }
 
     return rocblas_status_success;
