@@ -19764,20 +19764,27 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zgebak_strided_batched(rocblas_handle 
 
     It is assumed that \f$H\f$ is already upper triangular in rows and columns 1:ilo-1 and
     ihi+1:n, as returned by \ref rocsolver_cgebal "GEBAL". If the matrix was reduced to Hessenberg
-    form as \f$A = Q H Q^H\f$ (see \ref rocsolver_cgehrd "GEHRD" and UNGHR),
+    form as \f$A = Q H Q^H\f$ (see \ref rocsolver_cgehrd "GEHRD"; Q is formed from its output
+    as by LAPACK's ZUNGHR),
     the Schur vectors of A can be obtained by passing Q on entry in Z with
     compz = rocsolver_schur_vectors_update.
 
     \note
     Matrices with n <= 75 are processed with the single-shift QR algorithm of LAPACK's ZLAHQR,
     and larger ones with the multishift QR algorithm with aggressive early deflation of ZLAQR0,
-    as in LAPACK. With rocsolver_set_alg_mode(handle, rocsolver_function_hseqr,
-    rocsolver_alg_mode_hybrid), the Schur form of the deflation windows of the latter (a small,
-    latency-bound computation) is computed on the host; the rest of the algorithm runs on the
-    GPU.
+    as in LAPACK; batches of at least 4 matrices with n <= 256 are also processed with the
+    former, all the matrices in parallel (which is faster than the latter, one matrix at a
+    time). As in LAPACK, if the former fails (which is rare), the rows where it did not
+    converge are processed again with the latter (for n < 49, on a copy of order 49 padded with
+    zeros); this needs a synchronization of the stream, which is skipped when the stream is
+    being captured in a HIP graph (info > 0 is then returned). With
+    rocsolver_set_alg_mode(handle, rocsolver_function_hseqr, rocsolver_alg_mode_hybrid), the
+    Schur form of the deflation windows of the latter (a small, latency-bound computation) is
+    computed on the host, except for windows larger than 256 (which only occur after several
+    iterations without deflations); the rest of the algorithm runs on the GPU.
 
     \note
-    For n > 75, the multishift algorithm is driven from the host: it reads a small status
+    The multishift algorithm is driven from the host: it reads a small status
     array back in each iteration (a synchronization of the stream) and runs some matrix-matrix
     products on an internal stream, so that HSEQR cannot be captured in a HIP graph.
     The active block H(ilo:ihi, ilo:ihi) splits into irreducible diagonal blocks at its
@@ -19879,20 +19886,27 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zhseqr(rocblas_handle handle,
 
     It is assumed that \f$H_l\f$ is already upper triangular in rows and columns 1:ilo-1 and
     ihi+1:n, as returned by \ref rocsolver_cgebal "GEBAL". If the matrix was reduced to Hessenberg
-    form as \f$A = Q H Q^H\f$ (see \ref rocsolver_cgehrd "GEHRD" and UNGHR),
+    form as \f$A = Q H Q^H\f$ (see \ref rocsolver_cgehrd "GEHRD"; Q is formed from its output
+    as by LAPACK's ZUNGHR),
     the Schur vectors of A can be obtained by passing Q on entry in Z with
     compz = rocsolver_schur_vectors_update.
 
     \note
     Matrices with n <= 75 are processed with the single-shift QR algorithm of LAPACK's ZLAHQR,
     and larger ones with the multishift QR algorithm with aggressive early deflation of ZLAQR0,
-    as in LAPACK. With rocsolver_set_alg_mode(handle, rocsolver_function_hseqr,
-    rocsolver_alg_mode_hybrid), the Schur form of the deflation windows of the latter (a small,
-    latency-bound computation) is computed on the host; the rest of the algorithm runs on the
-    GPU.
+    as in LAPACK; batches of at least 4 matrices with n <= 256 are also processed with the
+    former, all the matrices in parallel (which is faster than the latter, one matrix at a
+    time). As in LAPACK, if the former fails (which is rare), the rows where it did not
+    converge are processed again with the latter (for n < 49, on a copy of order 49 padded with
+    zeros); this needs a synchronization of the stream, which is skipped when the stream is
+    being captured in a HIP graph (info > 0 is then returned). With
+    rocsolver_set_alg_mode(handle, rocsolver_function_hseqr, rocsolver_alg_mode_hybrid), the
+    Schur form of the deflation windows of the latter (a small, latency-bound computation) is
+    computed on the host, except for windows larger than 256 (which only occur after several
+    iterations without deflations); the rest of the algorithm runs on the GPU.
 
     \note
-    For n > 75, the multishift algorithm is driven from the host: it reads a small status
+    The multishift algorithm is driven from the host: it reads a small status
     array back in each iteration (a synchronization of the stream) and runs some matrix-matrix
     products on an internal stream, so that HSEQR cannot be captured in a HIP graph.
     The active block H(ilo:ihi, ilo:ihi) splits into irreducible diagonal blocks at its
@@ -20003,20 +20017,27 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zhseqr_batched(rocblas_handle handle,
 
     It is assumed that \f$H_l\f$ is already upper triangular in rows and columns 1:ilo-1 and
     ihi+1:n, as returned by \ref rocsolver_cgebal "GEBAL". If the matrix was reduced to Hessenberg
-    form as \f$A = Q H Q^H\f$ (see \ref rocsolver_cgehrd "GEHRD" and UNGHR),
+    form as \f$A = Q H Q^H\f$ (see \ref rocsolver_cgehrd "GEHRD"; Q is formed from its output
+    as by LAPACK's ZUNGHR),
     the Schur vectors of A can be obtained by passing Q on entry in Z with
     compz = rocsolver_schur_vectors_update.
 
     \note
     Matrices with n <= 75 are processed with the single-shift QR algorithm of LAPACK's ZLAHQR,
     and larger ones with the multishift QR algorithm with aggressive early deflation of ZLAQR0,
-    as in LAPACK. With rocsolver_set_alg_mode(handle, rocsolver_function_hseqr,
-    rocsolver_alg_mode_hybrid), the Schur form of the deflation windows of the latter (a small,
-    latency-bound computation) is computed on the host; the rest of the algorithm runs on the
-    GPU.
+    as in LAPACK; batches of at least 4 matrices with n <= 256 are also processed with the
+    former, all the matrices in parallel (which is faster than the latter, one matrix at a
+    time). As in LAPACK, if the former fails (which is rare), the rows where it did not
+    converge are processed again with the latter (for n < 49, on a copy of order 49 padded with
+    zeros); this needs a synchronization of the stream, which is skipped when the stream is
+    being captured in a HIP graph (info > 0 is then returned). With
+    rocsolver_set_alg_mode(handle, rocsolver_function_hseqr, rocsolver_alg_mode_hybrid), the
+    Schur form of the deflation windows of the latter (a small, latency-bound computation) is
+    computed on the host, except for windows larger than 256 (which only occur after several
+    iterations without deflations); the rest of the algorithm runs on the GPU.
 
     \note
-    For n > 75, the multishift algorithm is driven from the host: it reads a small status
+    The multishift algorithm is driven from the host: it reads a small status
     array back in each iteration (a synchronization of the stream) and runs some matrix-matrix
     products on an internal stream, so that HSEQR cannot be captured in a HIP graph.
     The active block H(ilo:ihi, ilo:ihi) splits into irreducible diagonal blocks at its

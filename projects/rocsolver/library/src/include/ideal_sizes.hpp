@@ -350,11 +350,41 @@
 #define HSEQR_BLOCKSIZE 256
 #endif
 
+/*! \brief Number of threads of the thread-block that computes the Schur form of each
+    medium-size Hessenberg matrix of a batch with the single-shift QR algorithm (see
+    HSEQR_BATCH_NMAX). It must be a multiple of 64. */
+#ifndef HSEQR_MEDIUM_BLOCKSIZE
+#define HSEQR_MEDIUM_BLOCKSIZE 128
+#endif
+
 /*! \brief Order of the largest matrix processed by HSEQR with the single-shift QR
     algorithm (ZLAHQR); larger matrices use the multishift QR algorithm with aggressive
     early deflation (ZLAQR0). As in LAPACK (IPARMQ, ISPEC = 12). */
 #ifndef HSEQR_NMIN
 #define HSEQR_NMIN 75
+#endif
+
+/*! \brief Order of the matrix on which HSEQR retries, with the multishift QR algorithm, the
+    rows of a small matrix (n < HSEQR_NL) where the single-shift QR algorithm failed: the matrix
+    is padded with zeros to this order. As in LAPACK ZHSEQR (NL = 49). */
+#ifndef HSEQR_NL
+#define HSEQR_NL 49
+#endif
+
+/*! \brief Batches of at least HSEQR_BATCH_MIN matrices of order n <= HSEQR_BATCH_NMAX are
+    processed by HSEQR with the single-shift QR algorithm (ZLAHQR), all the matrices of the
+    batch in parallel, also when n > HSEQR_NMIN.
+
+    \details The multishift QR algorithm is driven from the host, one matrix at a time; for
+    a batch of medium-size matrices, the single-shift QR algorithm on all of them in parallel
+    is faster (for example, about 4 times faster for 8 to 32 matrices of order 100 to 300 on a
+    gfx1150; HSEQR_BATCH_NMAX is set below the measured crossover). The rows of the
+    matrices where it fails are processed again with the multishift algorithm, as in LAPACK. */
+#ifndef HSEQR_BATCH_NMAX
+#define HSEQR_BATCH_NMAX 256
+#endif
+#ifndef HSEQR_BATCH_MIN
+#define HSEQR_BATCH_MIN 4
 #endif
 
 /*! \brief Maximum number of simultaneous shifts of the multishift QR sweeps of HSEQR
@@ -392,6 +422,15 @@
     iterations without deflations, as in LAPACK.)*/
 #ifndef HSEQR_AED_WINDOW_MAX
 #define HSEQR_AED_WINDOW_MAX 64
+#endif
+
+/*! \brief Largest deflation window whose core (Schur form of the window, deflation tests)
+    runs on the host in the hybrid mode of HSEQR; the cores of larger windows (which only
+    occur after several iterations without deflations, as the window then grows) run on the
+    device with the multishift QR algorithm, as LAPACK ZLAQR0 uses ZLAQR4 for windows larger
+    than NMIN (75), while the host only has the single-shift QR algorithm (ZLAHQR). */
+#ifndef HSEQR_HYBRID_WMAX
+#define HSEQR_HYBRID_WMAX 256
 #endif
 
 /***************** trexc **********************************************

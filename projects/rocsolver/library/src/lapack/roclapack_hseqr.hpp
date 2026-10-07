@@ -172,8 +172,12 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) hseqr_check_kernel(const I n,
     Schur vectors of each Hessenberg matrix in the batch, following LAPACK ZHSEQR.
     Each matrix is processed by a single thread-block of BS threads with the
     single-shift algorithm of ZLAHQR. It is used for n <= HSEQR_NMIN (75, as in
-    LAPACK); larger matrices use the multishift algorithm (hseqr_multishift). **/
-template <int BS, typename T, typename I, typename UH, typename UZ>
+    LAPACK); larger matrices use the multishift algorithm (hseqr_multishift). With LDS,
+    the matrices with ilo = 1 and ihi = n (and n <= HQR_LDS_NMAX, wantt and wantz) are
+    processed in shared memory (lahqr_lds_block). The first row of the rows iterated on
+    (see below) is stored in ilo1A, for the retry of the failures (see
+    rocsolver_hseqr_template). **/
+template <int BS, bool LDS, typename T, typename I, typename UH, typename UZ>
 ROCSOLVER_KERNEL void __launch_bounds__(BS) hseqr_kernel(const rocsolver_schur_job job,
                                                          const rocsolver_schur_vectors compz,
                                                          const I n,
@@ -189,7 +193,8 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) hseqr_kernel(const rocsolver_schur_j
                                                          const rocblas_stride shiftZ,
                                                          const I ldz,
                                                          const rocblas_stride strideZ,
-                                                         I* infoA)
+                                                         I* infoA,
+                                                         I* ilo1A)
 {
     const I bid = hipBlockIdx_x;
     const I tid = hipThreadIdx_x;
@@ -240,6 +245,8 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) hseqr_kernel(const rocsolver_schur_j
         {
             W[ilo - 1] = h(ilo, ilo);
             infoA[bid] = 0;
+            if(ilo1A)
+                ilo1A[bid] = ilo;
         }
         return;
     }
@@ -252,11 +259,22 @@ ROCSOLVER_KERNEL void __launch_bounds__(BS) hseqr_kernel(const rocsolver_schur_j
     I info = 0;
     if(ibad > 0)
         hseqr_set_nonfinite<BS>(ilo, ibad, W);
-    if(ibad < ihi)
+    if constexpr(LDS)
+    {
+        __shared__ T lds_ws[HQR_LDS_WS_SIZE];
+        if(ibad == 0 && ilo == 1 && ihi == n && wantt && wantz && n <= HQR_LDS_NMAX)
+            info = lahqr_lds_block<BS>(n, H, ldh, W, Z, ldz, lds_ws);
+        else if(ibad < ihi)
+            info = lahqr_block<BS>(wantt, wantz, n, ibad > 0 ? ibad + 1 : ilo, ihi, H, ldh, W, ilo,
+                                   ihi, Z, ldz, s_red, buf);
+    }
+    else if(ibad < ihi)
         info = lahqr_block<BS>(wantt, wantz, n, ibad > 0 ? ibad + 1 : ilo, ihi, H, ldh, W, ilo, ihi,
                                Z, ldz, s_red, buf);
     if(info == 0)
         info = ibad;
+    if(tid == 0 && ilo1A)
+        ilo1A[bid] = ibad > 0 ? ibad + 1 : ilo;
     __syncthreads();
 
     // clear out the trash, if necessary
@@ -527,6 +545,25 @@ struct hseqr_side_stream
     }
 };
 
+/** HSEQR_CHASE_GROUPS returns the number of thread-blocks that chase the bulges of a
+    chunk (with accum). They synchronize with grid barriers (laqr5_grid_barrier), so they
+    must all become resident: at most a quarter of the compute units are requested, each of
+    which can hold one of them (checked with the occupancy of the kernel; otherwise a single
+    thread-block is used). Kernels running concurrently on the side stream may delay some of
+    them, but not indefinitely, as those kernels do not wait for the chase; if they do not
+    all become resident (for example with other processes on the device), the first one
+    chases the chunk alone (see laqr5_coresident). **/
+template <typename T, typename I>
+rocblas_status hseqr_chase_groups(rocblas_handle handle, I& maxgroups)
+{
+    const int ncu = rocblas_internal_get_device_prop(handle)->multiProcessorCount;
+    int occupancy = 0;
+    HIP_CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occupancy, laqr5_chunk_kernel<HSEQR_CHASE_BLOCKSIZE, T, I>, HSEQR_CHASE_BLOCKSIZE, 0));
+    maxgroups = (occupancy >= 1) ? std::max(1, std::min(int(HSEQR_CHASE_GROUPS), ncu / 4)) : 1;
+    return rocblas_status_success;
+}
+
 /** HSEQR_WORKT_LAYOUT is the layout of the scalar workspace workT of HSEQR (in entries
     of type T) for matrices of order n: the status scalars, the reflections of two chunks
     of the sweep with the largest number of shifts (see hseqr_multishift), and the
@@ -665,7 +702,12 @@ ROCSOLVER_KERNEL void hseqr_reset_barrier_kernel(unsigned* bar)
     the host, with the same code as on the device (except that the Schur form of the
     window always uses ZLAHQR, and in a different order of operations, so that the
     results are equally valid but not bitwise identical): the window is copied to the
-    host and back in each iteration. **/
+    host and back in each iteration, except for windows larger than HSEQR_HYBRID_WMAX, whose
+    core runs on the device (laqr0_core4_kernel), as LAPACK uses ZLAQR4 for large windows.
+
+    The side stream (side, with side.s0 the stream of the handle) and the number of
+    thread-blocks of the chase (maxgroups, see hseqr_chase_groups) are set up once by the
+    caller for all the matrices of the batch. **/
 template <typename T, typename I>
 rocblas_status hseqr_multishift(rocblas_handle handle,
                                 const bool wantt,
@@ -684,6 +726,8 @@ rocblas_status hseqr_multishift(rocblas_handle handle,
                                 T* dstatusT,
                                 unsigned* dbar,
                                 const bool hybrid,
+                                hseqr_side_stream& side,
+                                const I maxgroups,
                                 I& info)
 {
     using S = decltype(std::real(T{}));
@@ -712,21 +756,6 @@ rocblas_status hseqr_multishift(rocblas_handle handle,
     };
     auto h = [&](const I i, const I j) -> T* { return H + idx2D(i - 1, j - 1, ldh); };
     auto z = [&](const I i, const I j) -> T* { return Z + idx2D(i - 1, j - 1, ldz); };
-    hseqr_side_stream side;
-    side.s0 = stream;
-
-    // number of thread-blocks that chase the bulges of a chunk (with accum). They
-    // synchronize with grid barriers (laqr5_grid_barrier), so they must all become
-    // resident: at most a quarter of the compute units are requested, each of which can
-    // hold one of them (checked with the occupancy of the kernel; otherwise a single
-    // thread-block is used). Kernels running concurrently on the side stream may delay
-    // some of them, but not indefinitely, as those kernels do not wait for the chase.
-    const int ncu = rocblas_internal_get_device_prop(handle)->multiProcessorCount;
-    int occupancy = 0;
-    HIP_CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occupancy, laqr5_chunk_kernel<HSEQR_CHASE_BLOCKSIZE, T, I>, HSEQR_CHASE_BLOCKSIZE, 0));
-    const I maxgroups
-        = (occupancy >= 1) ? std::max(1, std::min(int(HSEQR_CHASE_GROUPS), ncu / 4)) : 1;
 
     // tuning parameters (LAPACK IPARMQ and ZLAQR0 3.9.0, with an unlimited LWORK)
     const I nhfull = ihi - ilo + 1;
@@ -823,7 +852,14 @@ rocblas_status hseqr_multishift(rocblas_handle handle,
                                      hipMemcpyDeviceToHost, stream));
             HIP_CHECK(hipStreamSynchronize(stream));
 
-            if(st[LAQR0_CORE])
+            // (large windows: the core on the device with the multishift QR algorithm, as
+            // the host only has the single-shift one; laqr0_core4_kernel also does part 2)
+            const bool core4 = st[LAQR0_CORE] && st[LAQR0_JW] > I(HSEQR_HYBRID_WMAX);
+            if(core4)
+                ROCSOLVER_LAUNCH_KERNEL((laqr0_core4_kernel<HSEQR_BLOCKSIZE, T>), dim3(1),
+                                        dim3(HSEQR_BLOCKSIZE), 0, stream, n, kbot, ndfl, nwmax,
+                                        nsr_t, nsmax, H, ldh, W, dstatus, dstatusT);
+            else if(st[LAQR0_CORE])
             {
                 // core of the aggressive early deflation on the host, with the window
                 // T = H(kv,kt) (and V = I) copied from the device
@@ -872,9 +908,10 @@ rocblas_status hseqr_multishift(rocblas_handle handle,
                                          hipMemcpyHostToDevice, stream));
             }
 
-            ROCSOLVER_LAUNCH_KERNEL((laqr0_part2_kernel<HSEQR_BLOCKSIZE, T>), dim3(1),
-                                    dim3(HSEQR_BLOCKSIZE), 0, stream, n, kbot, ndfl, nwmax, nsr_t,
-                                    nsmax, H, ldh, W, dstatus, dstatusT);
+            if(!core4)
+                ROCSOLVER_LAUNCH_KERNEL((laqr0_part2_kernel<HSEQR_BLOCKSIZE, T>), dim3(1),
+                                        dim3(HSEQR_BLOCKSIZE), 0, stream, n, kbot, ndfl, nwmax,
+                                        nsr_t, nsmax, H, ldh, W, dstatus, dstatusT);
         }
         HIP_CHECK(hipMemcpyAsync(st, dstatus, sizeof(I) * LAQR0_STATUS_SIZE, hipMemcpyDeviceToHost,
                                  stream));
@@ -1179,19 +1216,24 @@ template <typename T, typename I>
 void rocsolver_hseqr_getMemorySize(const I n, const I batch_count, size_t* size_work, size_t* size_workT)
 {
     // status arrays of the multishift path
-    if(n <= HSEQR_NMIN || batch_count == 0)
+    if(n == 0 || batch_count == 0)
     {
         *size_work = 0;
         *size_workT = 0;
     }
     else
     {
-        // (and the flags of the matrices with NaN or infinite entries, and the counters of
-        // the grid barrier of the sweep)
-        *size_work = sizeof(I) * (LAQR0_STATUS_SIZE + batch_count + 2);
+        // (and the flags of the matrices with NaN or infinite entries, or the first rows
+        // iterated on by the single-shift path, and the counters of the grid barrier of the
+        // sweep)
+        *size_work = sizeof(I) * (LAQR0_STATUS_SIZE + batch_count + 4);
         // (and the reflections of two chunks of the sweep and the compact copy of the band
-        // of a chunk, see hseqr_multishift)
-        *size_workT = sizeof(T) * hseqr_workT_layout(n).size;
+        // of a chunk, see hseqr_multishift; the single-shift path retries the failures with
+        // the multishift one, on a copy of order HSEQR_NL when n < HSEQR_NL, as in LAPACK)
+        const I nl = std::max(n, I(HSEQR_NL));
+        *size_workT = sizeof(T) * hseqr_workT_layout(nl).size;
+        if(n < HSEQR_NL)
+            *size_workT += sizeof(T) * size_t(nl) * nl;
     }
 }
 
@@ -1268,18 +1310,6 @@ rocblas_status rocsolver_hseqr_template(rocblas_handle handle,
     hipStream_t stream;
     rocblas_get_stream(handle, &stream);
 
-    // small matrices: single-shift QR (ZLAHQR), all the matrices of the batch in parallel
-    // (when n == 0 the kernel only sets info = 0)
-    if(n <= HSEQR_NMIN)
-    {
-        ROCSOLVER_LAUNCH_KERNEL((hseqr_kernel<HSEQR_BLOCKSIZE, T>), dim3(batch_count),
-                                dim3(HSEQR_BLOCKSIZE), 0, stream, job, compz, n, ilo, ihi, H,
-                                shiftH, ldh, strideH, W, strideW, Z, shiftZ, ldz, strideZ, info);
-        return rocblas_status_success;
-    }
-
-    // larger matrices: multishift QR with aggressive early deflation (ZLAQR0), one matrix
-    // of the batch at a time (the control flow depends on the data)
     const bool wantt = (job == rocsolver_schur_form);
     const bool wantz = (compz != rocsolver_schur_vectors_none);
 
@@ -1287,6 +1317,159 @@ rocblas_status rocsolver_hseqr_template(rocblas_handle handle,
     rocsolver_alg_mode alg_mode;
     ROCBLAS_CHECK(rocsolver_get_alg_mode(handle, rocsolver_function_hseqr, &alg_mode));
     const bool hybrid = (alg_mode == rocsolver_alg_mode_hybrid);
+
+    // side stream of the sweeps and number of thread-blocks of the chase, for all the
+    // matrices (see hseqr_multishift)
+    hseqr_side_stream side;
+    side.s0 = stream;
+    I maxgroups = 1;
+
+    // small matrices, and batches of medium-size matrices (see HSEQR_BATCH_NMAX):
+    // single-shift QR (ZLAHQR), all the matrices of the batch in parallel (when n == 0 the
+    // kernel only sets info = 0)
+    if(n <= HSEQR_NMIN || (n <= HSEQR_BATCH_NMAX && batch_count >= HSEQR_BATCH_MIN))
+    {
+        I* dilo1 = (n > 0) ? work + LAQR0_STATUS_SIZE : nullptr;
+        auto launch = [&](auto bs, auto lds) {
+            ROCSOLVER_LAUNCH_KERNEL((hseqr_kernel<decltype(bs)::value, decltype(lds)::value, T>),
+                                    dim3(batch_count), dim3(decltype(bs)::value), 0, stream, job,
+                                    compz, n, ilo, ihi, H, shiftH, ldh, strideH, W, strideW, Z,
+                                    shiftZ, ldz, strideZ, info, dilo1);
+        };
+        using std::integral_constant;
+        // Configuration of the kernel for n <= HSEQR_NMIN, from timings of zhseqr on gfx942
+        // (wave64) and gfx1150 (wave32) with batches of 1 to 4000 matrices: the Schur form in
+        // shared memory (n <= HQR_LDS_NMAX, with the Schur form and vectors) is about 1.7 times
+        // faster per matrix, but it allows few thread-blocks per compute unit; on wave64
+        // targets, plain thread-blocks of 64 to 256 threads (by n) are faster once the batch
+        // needs more than one wave of the shared memory kernel. On wave32 targets the shared
+        // memory kernel is faster for all the batches, and otherwise 64 threads are best.
+        const hipDeviceProp_t* props = rocblas_internal_get_device_prop(handle);
+        bool lds = wantt && wantz && n <= HQR_LDS_NMAX;
+        const bool wave64 = (props->warpSize == 64);
+        if(lds && wave64)
+        {
+            int occupancy = 0;
+            HIP_CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                &occupancy, hseqr_kernel<64, true, T, I, U, U>, 64, 0));
+            lds = (int64_t(batch_count) <= int64_t(occupancy) * props->multiProcessorCount);
+        }
+        if(n > HSEQR_NMIN)
+            launch(integral_constant<int, HSEQR_MEDIUM_BLOCKSIZE>{}, std::false_type{});
+        else if(lds)
+            launch(integral_constant<int, 64>{}, std::true_type{});
+        else if(!wave64 || n <= 32)
+            launch(integral_constant<int, 64>{}, std::false_type{});
+        else if(n <= 64)
+            launch(integral_constant<int, 128>{}, std::false_type{});
+        else
+            launch(integral_constant<int, 256>{}, std::false_type{});
+        if(n == 0)
+            return rocblas_status_success;
+
+        // As in LAPACK ZHSEQR, the rows ilo1:info of a matrix where ZLAHQR fails (info > 0,
+        // which is rare) are processed again with the multishift algorithm (ZLAQR0), which
+        // sometimes succeeds; for n < HSEQR_NL, on a copy of order HSEQR_NL padded with
+        // zeros. This needs the values of info on the host, so that it is skipped when the
+        // stream is being captured in a HIP graph (info > 0 is then returned).
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        HIP_CHECK(hipStreamIsCapturing(stream, &capture));
+        if(capture != hipStreamCaptureStatusNone)
+            return rocblas_status_success;
+        std::vector<I> hinfo(batch_count), hilo1(batch_count), hilo(batch_count), hihi(batch_count);
+        HIP_CHECK(hipMemcpyAsync(hinfo.data(), info, sizeof(I) * batch_count, hipMemcpyDeviceToHost,
+                                 stream));
+        HIP_CHECK(hipMemcpyAsync(hilo1.data(), dilo1, sizeof(I) * batch_count,
+                                 hipMemcpyDeviceToHost, stream));
+        HIP_CHECK(hipStreamSynchronize(stream));
+        bool any = false;
+        for(I b = 0; b < batch_count; b++)
+            any = any || (hinfo[b] > 0 && hinfo[b] >= hilo1[b]);
+        if(!any)
+            return rocblas_status_success;
+
+        HIP_CHECK(hipMemcpyAsync(hilo.data(), ilo, sizeof(I) * batch_count, hipMemcpyDeviceToHost,
+                                 stream));
+        HIP_CHECK(hipMemcpyAsync(hihi.data(), ihi, sizeof(I) * batch_count, hipMemcpyDeviceToHost,
+                                 stream));
+        std::vector<T*> hH(batch_count), hZ(batch_count, nullptr);
+        if constexpr(BATCHED)
+        {
+            HIP_CHECK(hipMemcpyAsync(hH.data(), H, sizeof(T*) * batch_count, hipMemcpyDeviceToHost,
+                                     stream));
+            if(wantz)
+                HIP_CHECK(hipMemcpyAsync(hZ.data(), Z, sizeof(T*) * batch_count,
+                                         hipMemcpyDeviceToHost, stream));
+        }
+        HIP_CHECK(hipStreamSynchronize(stream));
+        ROCBLAS_CHECK(hseqr_chase_groups<T>(handle, maxgroups));
+
+        const I nl = std::max(n, I(HSEQR_NL));
+        T* Hl = workT + hseqr_workT_layout(nl).size;
+        unsigned* dbar = reinterpret_cast<unsigned*>(work + LAQR0_STATUS_SIZE + batch_count);
+        const I blocks = (nl - 1) / BS1 + 1;
+        const I blocks2 = (nl - 1) / BS2 + 1;
+        for(I b = 0; b < batch_count; b++)
+        {
+            if(!(hinfo[b] > 0 && hinfo[b] >= hilo1[b]))
+                continue;
+            T* Hb;
+            T* Zb = nullptr;
+            if constexpr(BATCHED)
+            {
+                Hb = hH[b] + shiftH;
+                if(wantz)
+                    Zb = hZ[b] + shiftZ;
+            }
+            else
+            {
+                Hb = H + shiftH + b * strideH;
+                if(wantz)
+                    Zb = Z + shiftZ + b * strideZ;
+            }
+            T* Wb = W + b * strideW;
+            const I ilob = std::min(std::max(hilo[b], I(1)), n);
+            const I ihib = std::min(std::max(hihi[b], ilob), n);
+            const I ilo1 = hilo1[b];
+            const I kbot = hinfo[b];
+
+            HIP_CHECK(hipMemsetAsync(dbar, 0, 4 * sizeof(unsigned), stream));
+            I infob = 0;
+            if(n >= HSEQR_NL)
+            {
+                ROCBLAS_CHECK(hseqr_multishift<T>(handle, wantt, wantz, n, ilo1, kbot, Hb, ldh, Wb,
+                                                  ilob, ihib, Zb, ldz, work, workT, dbar, hybrid,
+                                                  side, maxgroups, infob));
+            }
+            else
+            {
+                // Hl = [H(1:n,1:n) 0; 0 0], of order nl
+                ROCSOLVER_LAUNCH_KERNEL(set_zero<T>, dim3(blocks2, blocks2, 1), dim3(BS2, BS2), 0,
+                                        stream, nl, nl, Hl, 0, nl, 0);
+                ROCSOLVER_LAUNCH_KERNEL((copy_mat<T, T*, T*>), dim3(blocks2, blocks2, 1),
+                                        dim3(BS2, BS2), 0, stream, n, n, Hb, 0, ldh, 0, Hl, 0, nl, 0);
+                ROCBLAS_CHECK(hseqr_multishift<T>(handle, wantt, wantz, nl, ilo1, kbot, Hl, nl, Wb,
+                                                  ilob, ihib, Zb, ldz, work, workT, dbar, hybrid,
+                                                  side, maxgroups, infob));
+                if(wantt || infob != 0)
+                    ROCSOLVER_LAUNCH_KERNEL((copy_mat<T, T*, T*>), dim3(blocks2, blocks2, 1),
+                                            dim3(BS2, BS2), 0, stream, n, n, Hl, 0, nl, 0, Hb, 0,
+                                            ldh, 0);
+            }
+            // (the rows above ilo1, if any, have a NaN or an infinite entry)
+            if(infob == 0)
+                infob = (ilo1 > ilob) ? ilo1 - 1 : 0;
+            // (clear out the trash, if necessary, as the multishift algorithm uses the part of
+            // H below its first subdiagonal as workspace)
+            ROCSOLVER_LAUNCH_KERNEL((hseqr_finish_kernel<T>), dim3(blocks), dim3(BS1), 0, stream,
+                                    wantt || infob != 0, n, Hb, ldh, info + b, infob);
+        }
+        return rocblas_status_success;
+    }
+
+    // larger matrices: multishift QR with aggressive early deflation (ZLAQR0), one matrix
+    // of the batch at a time (the control flow depends on the data)
+    ROCBLAS_CHECK(hseqr_chase_groups<T>(handle, maxgroups));
 
     const I blocks = (n - 1) / BS1 + 1;
     ROCSOLVER_LAUNCH_KERNEL((hseqr_prepare_kernel<T>), dim3(blocks, batch_count), dim3(BS1), 0,
@@ -1297,7 +1480,7 @@ rocblas_status rocsolver_hseqr_template(rocblas_handle handle,
     // iterated on
     I* dflag = work + LAQR0_STATUS_SIZE;
     unsigned* dbar = reinterpret_cast<unsigned*>(dflag + batch_count);
-    HIP_CHECK(hipMemsetAsync(dbar, 0, 2 * sizeof(unsigned), stream));
+    HIP_CHECK(hipMemsetAsync(dbar, 0, 4 * sizeof(unsigned), stream));
     HIP_CHECK(hipMemsetAsync(dflag, 0, sizeof(I) * batch_count, stream));
     ROCSOLVER_LAUNCH_KERNEL((hseqr_any_nonfinite_kernel<HSEQR_BLOCKSIZE, T>),
                             dim3(std::min(n, I(1024)), batch_count), dim3(HSEQR_BLOCKSIZE), 0,
@@ -1353,8 +1536,9 @@ rocblas_status rocsolver_hseqr_template(rocblas_handle handle,
         const I ilo1 = ibad > 0 ? ibad + 1 : ilob;
         I infob = 0;
         if(ilo1 < ihib)
-            ROCBLAS_CHECK(hseqr_multishift<T>(handle, wantt, wantz, n, ilo1, ihib, Hb, ldh, Wb, ilob,
-                                              ihib, Zb, ldz, work, workT, dbar, hybrid, infob));
+            ROCBLAS_CHECK(hseqr_multishift<T>(handle, wantt, wantz, n, ilo1, ihib, Hb, ldh, Wb,
+                                              ilob, ihib, Zb, ldz, work, workT, dbar, hybrid, side,
+                                              maxgroups, infob));
         if(infob == 0)
             infob = ibad;
 

@@ -35,7 +35,8 @@ using namespace std;
 
 typedef std::tuple<vector<int>, vector<char>> hseqr_tuple;
 
-// each matrix_size_range vector is a {n, ldh, ldz, mtype}
+// each matrix_size_range vector is a {n, ldh, ldz, mtype} or {n, ldh, ldz, mtype, batch_count}
+// (batch_count of the batched and strided-batched tests, 3 by default)
 // mtype = 0: random matrix,
 // mtype = 1: matrix with clustered eigenvalues,
 // mtype = 2: matrix with a cluster of eigenvalues near zero,
@@ -112,6 +113,12 @@ const vector<vector<int>> matrix_size_range = {
     {120, 120, 120, 16},
     {50, 50, 50, 17},
     {120, 120, 120, 17},
+    // batches of medium-size matrices (single-shift algorithm, all the matrices in parallel)
+    {100, 100, 100, 0, 4},
+    {150, 160, 150, 2, 5},
+    {120, 120, 120, 12, 4},
+    {120, 120, 120, 14, 4},
+    {250, 250, 250, 4, 4},
 };
 
 // for daily_lapack tests
@@ -167,7 +174,8 @@ protected:
            && arg.peek<char>("compz") == 'I')
             testing_hseqr_bad_arg<BATCHED, STRIDED, T>();
 
-        arg.batch_count = (BATCHED || STRIDED ? 3 : 1);
+        const vector<int> matrix_size = std::get<0>(GetParam());
+        arg.batch_count = (BATCHED || STRIDED) ? (matrix_size.size() > 4 ? matrix_size[4] : 3) : 1;
         arg.alg_mode = MODE;
         testing_hseqr<BATCHED, STRIDED, T>(arg);
     }
