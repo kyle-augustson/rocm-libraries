@@ -47,21 +47,16 @@ ROCSOLVER_BEGIN_NAMESPACE
     on the host (the hybrid mode of HSEQR), with BS = 1. The indices
     ifst and ilst are 1-based, as in LAPACK, and must satisfy 1 <= ifst, ilst <= n.
     The rotations of each swap are computed redundantly by all the threads, and their
-    application to the rows and columns of T and Q is distributed among the threads. **/
-template <int BS, typename T, typename I>
-__host__ __device__ __forceinline__ void trexc_block(const bool wantq,
-                                                     const I n,
-                                                     T* A,
-                                                     const I ldt,
-                                                     T* Q,
-                                                     const I ldq,
-                                                     const I ifst,
-                                                     const I ilst)
+    application to the rows and columns of T and Q is distributed among the threads.
+    TREXC_BLOCK_ACC is the same with T given by an accessor t(i, j) (1-based, i <= j), so
+    that T can be kept in another layout (for example packed in shared memory). **/
+template <int BS, typename T, typename I, typename TA>
+__host__ __device__ __forceinline__ void
+    trexc_block_acc(const bool wantq, const I n, TA&& t, T* Q, const I ldq, const I ifst, const I ilst)
 {
     using S = decltype(std::real(T{}));
 
     const I tid = hqr_tid();
-    auto t = [&](const I i, const I j) -> T& { return A[idx2D(i - 1, j - 1, ldt)]; };
     auto q = [&](const I i, const I j) -> T& { return Q[idx2D(i - 1, j - 1, ldq)]; };
 
     // quick return if possible
@@ -110,6 +105,21 @@ __host__ __device__ __forceinline__ void trexc_block(const bool wantq,
         }
         hqr_sync();
     }
+}
+
+template <int BS, typename T, typename I>
+__host__ __device__ __forceinline__ void trexc_block(const bool wantq,
+                                                     const I n,
+                                                     T* A,
+                                                     const I ldt,
+                                                     T* Q,
+                                                     const I ldq,
+                                                     const I ifst,
+                                                     const I ilst)
+{
+    trexc_block_acc<BS>(
+        wantq, n, [&](const I i, const I j) -> T& { return A[idx2D(i - 1, j - 1, ldt)]; }, Q, ldq,
+        ifst, ilst);
 }
 
 template <int BS, typename T, typename I, typename U>

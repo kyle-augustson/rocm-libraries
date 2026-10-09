@@ -477,12 +477,26 @@ __host__ __device__ __forceinline__ void
     auto v = [&](const I i, const I j) -> T& { return V[idx2D(i - 1, j - 1, ldv)]; };
 
     // (on the host, the routines of host_ops, if given, replace the generic ones)
+    // On the device, for small windows, the upper triangle of the Schur form is kept packed
+    // in the shared workspace during the reordering (deflation loop and sort): each swap of
+    // trexc is a short dependent step whose latency the accesses to T dominate.
+    // (column j holds the rows 1:j, at offset j(j-1)/2)
+    T* const Tp = lds_ws;
+    bool tpacked = false;
+    auto tr = [&](const I i, const I j) -> T& {
+        return tpacked ? Tp[j * (j - 1) / 2 + i - 1] : t(i, j);
+    };
     auto trexc = [&](const I ifst, const I ilst) {
 #if !defined(__HIP_DEVICE_COMPILE__)
         if(host_ops && host_ops->trexc)
             return host_ops->trexc(jw, Tw, ldt, V, ldv, ifst, ilst);
 #endif
-        trexc_block<BS>(true, jw, Tw, ldt, V, ldv, ifst, ilst);
+        if(tpacked)
+            trexc_block_acc<BS>(
+                true, jw, [&](const I i, const I j) -> T& { return Tp[j * (j - 1) / 2 + i - 1]; },
+                V, ldv, ifst, ilst);
+        else
+            trexc_block<BS>(true, jw, Tw, ldt, V, ldv, ifst, ilst);
     };
     auto larf_left = [&](const I m, const I nc, const T* x, const T tau, T* C, const I ldc) {
 #if !defined(__HIP_DEVICE_COMPILE__)
@@ -524,7 +538,21 @@ __host__ __device__ __forceinline__ void
     else if constexpr(BS >= HQR_LDS_NMAX)
     {
         if(lds_ws && jw <= HQR_LDS_NMAX)
+        {
             infqr = lahqr_lds_block<BS>(jw, Tw, ldt, Wsh, V, ldv, lds_ws);
+            // (lahqr_lds_block has written T back: the workspace is free; jw(jw+1)/2 entries
+            // fit in it)
+            static_assert(HQR_LDS_NMAX * (HQR_LDS_NMAX + 1) / 2 <= HQR_LDS_WS_SIZE,
+                          "the packed triangle must fit in the shared workspace");
+            hqr_sync();
+            for(I e = tid; e < jw * jw; e += BS)
+            {
+                const I i = e % jw + 1, j = e / jw + 1;
+                if(i <= j)
+                    Tp[j * (j - 1) / 2 + i - 1] = t(i, j);
+            }
+            tpacked = true;
+        }
         else
             infqr = lahqr_block<BS>(true, true, jw, I(1), jw, Tw, ldt, Wsh, I(1), jw, V, ldv,
                                     s_ired, ibuf);
@@ -545,7 +573,7 @@ __host__ __device__ __forceinline__ void
     for(I knt = infqr + 1; knt <= jw; knt++)
     {
         // small spike tip deflation test
-        S foo = hqr_cabs1(t(ns, ns));
+        S foo = hqr_cabs1(tr(ns, ns));
         if(foo == 0)
             foo = hqr_cabs1(s);
         if(hqr_cabs1(s) * hqr_cabs1(v(1, ns)) <= std::max(smlnum, ulp * foo))
@@ -573,7 +601,7 @@ __host__ __device__ __forceinline__ void
         {
             I ifst = i;
             for(I j = i + 1; j <= ns; j++)
-                if(hqr_cabs1(t(j, j)) > hqr_cabs1(t(ifst, ifst)))
+                if(hqr_cabs1(tr(j, j)) > hqr_cabs1(tr(ifst, ifst)))
                     ifst = j;
             if(ifst != i)
             {
@@ -583,6 +611,19 @@ __host__ __device__ __forceinline__ void
         }
     }
     hqr_sync();
+
+    // (the packed triangle back into T)
+    if(tpacked)
+    {
+        for(I e = tid; e < jw * jw; e += BS)
+        {
+            const I i = e % jw + 1, j = e / jw + 1;
+            if(i <= j)
+                t(i, j) = Tp[j * (j - 1) / 2 + i - 1];
+        }
+        tpacked = false;
+        hqr_sync();
+    }
 
     // restore shift/eigenvalue array from T
     for(I i = infqr + 1 + tid; i <= jw; i += BS)
