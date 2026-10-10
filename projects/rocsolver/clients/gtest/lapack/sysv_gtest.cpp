@@ -35,8 +35,9 @@ using namespace std;
 
 typedef std::tuple<vector<int>, int, printable_char> sysv_tuple;
 
-// each matrix_size_range vector is a {n, lda, ldb, singular}
+// each matrix_size_range vector is a {n, lda, ldb, singular} or {n, lda, ldb, singular, 1}
 // if singular = 1, then the matrix in the middle of the batch is singular
+// a fifth element 1 uses random symmetric indefinite matrices (irregular 1x1 and 2x2 pivots)
 
 // each nrhs_range is a {nrhs}
 // nrhs = 0 still factorizes A
@@ -62,7 +63,11 @@ const vector<vector<int>> matrix_size_range = {
     {32, 32, 40, 1},
     {50, 60, 50, 0},
     {70, 100, 70, 1},
-    {130, 130, 135, 1}};
+    {130, 130, 135, 1},
+    {2, 2, 2, 0, 1},
+    {9, 9, 9, 1, 1},
+    {40, 40, 41, 0, 1},
+    {150, 150, 150, 1, 1}};
 
 const vector<int> nrhs_range = {
     // invalid
@@ -99,6 +104,8 @@ Arguments sysv_setup_arguments(sysv_tuple tup)
 
     arg.timing = 0;
     arg.singular = matrix_size[3];
+    if(matrix_size.size() > 4 && matrix_size[4] == 1)
+        arg.set<char>("pivots", 'R');
 
     return arg;
 }

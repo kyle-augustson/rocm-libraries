@@ -164,7 +164,8 @@ void sysv_initData(const rocblas_handle handle,
                    const rocblas_int bc,
                    Th& hA,
                    Th& hB,
-                   const bool singular)
+                   const bool singular,
+                   const char pivots = 'D')
 {
     if(CPU)
     {
@@ -174,25 +175,43 @@ void sysv_initData(const rocblas_handle handle,
 
         for(rocblas_int b = 0; b < bc; ++b)
         {
-            // scale A to avoid singularities
-            for(rocblas_int i = 0; i < n; i++)
+            if(pivots == 'R')
             {
+                // a symmetric indefinite matrix with random entries (without ties), whose
+                // factorization has 1-by-1 and 2-by-2 blocks and interchanges in no particular
+                // pattern
                 for(rocblas_int j = 0; j < n; j++)
                 {
-                    if(i == j)
-                        hA[b][i + j * lda] += 400;
-                    else
-                        hA[b][i + j * lda] -= 4;
+                    for(rocblas_int i = 0; i <= j; i++)
+                    {
+                        T const v = hA[b][i + j * lda] - T(5.5) + T(0.001 * ((i * 31 + j * 17) % 97));
+                        hA[b][i + j * lda] = v;
+                        hA[b][j + i * lda] = v;
+                    }
                 }
             }
-
-            // shuffle rows to test pivoting (this moves the dominant elements to the
-            // anti-diagonal of the referenced triangle, so that 2x2 pivots are needed)
-            // always the same permutation for debugging purposes
-            for(rocblas_int i = 0; i < n / 2; i++)
+            else
             {
-                for(rocblas_int j = 0; j < n; j++)
-                    std::swap(hA[b][i + j * lda], hA[b][n - 1 - i + j * lda]);
+                // scale A to avoid singularities
+                for(rocblas_int i = 0; i < n; i++)
+                {
+                    for(rocblas_int j = 0; j < n; j++)
+                    {
+                        if(i == j)
+                            hA[b][i + j * lda] += 400;
+                        else
+                            hA[b][i + j * lda] -= 4;
+                    }
+                }
+
+                // shuffle rows to test pivoting (this moves the dominant elements to the
+                // anti-diagonal of the referenced triangle, so that 2x2 pivots are needed)
+                // always the same permutation for debugging purposes
+                for(rocblas_int i = 0; i < n / 2; i++)
+                {
+                    for(rocblas_int j = 0; j < n; j++)
+                        std::swap(hA[b][i + j * lda], hA[b][n - 1 - i + j * lda]);
+                }
             }
 
             if(singular && b == bc / 2)
@@ -259,14 +278,15 @@ void sysv_getError(const rocblas_handle handle,
                    Uh& hInfo,
                    Uh& hInfoRes,
                    double* max_err,
-                   const bool singular)
+                   const bool singular,
+                   const char pivots = 'D')
 {
     rocblas_int lwork = 64 * n;
     std::vector<T> work(lwork);
 
     // input data initialization
     sysv_initData<true, true, T>(handle, uplo, n, nrhs, dA, lda, stA, dB, ldb, stB, bc, hA, hB,
-                                 singular);
+                                 singular, pivots);
 
     // keep a copy of the right-hand sides
     // (B must not be modified when D is singular, nor outside of its first n rows)
@@ -383,7 +403,8 @@ void sysv_getPerfData(const rocblas_handle handle,
                       const int profile,
                       const bool profile_kernels,
                       const bool perf,
-                      const bool singular)
+                      const bool singular,
+                      const char pivots = 'D')
 {
     rocblas_int lwork = 64 * n;
     std::vector<T> work(lwork);
@@ -391,7 +412,7 @@ void sysv_getPerfData(const rocblas_handle handle,
     if(!perf)
     {
         sysv_initData<true, false, T>(handle, uplo, n, nrhs, dA, lda, stA, dB, ldb, stB, bc, hA, hB,
-                                      singular);
+                                      singular, pivots);
 
         // cpu-lapack performance (only if not in perf mode)
         *cpu_time_used = get_time_us_no_sync();
@@ -404,13 +425,13 @@ void sysv_getPerfData(const rocblas_handle handle,
     }
 
     sysv_initData<true, false, T>(handle, uplo, n, nrhs, dA, lda, stA, dB, ldb, stB, bc, hA, hB,
-                                  singular);
+                                  singular, pivots);
 
     // cold calls
     for(int iter = 0; iter < 2; iter++)
     {
         sysv_initData<false, true, T>(handle, uplo, n, nrhs, dA, lda, stA, dB, ldb, stB, bc, hA, hB,
-                                      singular);
+                                      singular, pivots);
 
         CHECK_ROCBLAS_ERROR(rocsolver_sysv(STRIDED, handle, uplo, n, nrhs, dA.data(), lda, stA,
                                            dIpiv.data(), stP, dB.data(), ldb, stB, dInfo.data(), bc));
@@ -434,7 +455,7 @@ void sysv_getPerfData(const rocblas_handle handle,
     for(rocblas_int iter = 0; iter < hot_calls; iter++)
     {
         sysv_initData<false, true, T>(handle, uplo, n, nrhs, dA, lda, stA, dB, ldb, stB, bc, hA, hB,
-                                      singular);
+                                      singular, pivots);
 
         timer.start(stream);
         rocsolver_sysv(STRIDED, handle, uplo, n, nrhs, dA.data(), lda, stA, dIpiv.data(), stP,
@@ -457,6 +478,7 @@ void testing_sysv(Arguments& argus)
     rocblas_stride stA = argus.get<rocblas_stride>("strideA", lda * n);
     rocblas_stride stP = argus.get<rocblas_stride>("strideP", n);
     rocblas_stride stB = argus.get<rocblas_stride>("strideB", ldb * nrhs);
+    char pivots = argus.get<char>("pivots", 'D');
 
     rocblas_fill uplo = char2rocblas_fill(uploC);
     rocblas_int bc = argus.batch_count;
@@ -596,14 +618,14 @@ void testing_sysv(Arguments& argus)
         if(argus.unit_check || argus.norm_check)
             sysv_getError<STRIDED, T>(handle, uplo, n, nrhs, dA, lda, stA, dIpiv, stP, dB, ldb, stB,
                                       dInfo, bc, hA, hARes, hIpiv, hIpivRes, hB, hBRes, hInfo,
-                                      hInfoRes, &max_error, argus.singular);
+                                      hInfoRes, &max_error, argus.singular, pivots);
 
         // collect performance data
         if(argus.timing && hot_calls > 0)
             sysv_getPerfData<STRIDED, T>(handle, uplo, n, nrhs, dA, lda, stA, dIpiv, stP, dB, ldb,
                                          stB, dInfo, bc, hA, hIpiv, hB, hInfo, &gpu_time_used,
                                          &cpu_time_used, hot_calls, argus.profile,
-                                         argus.profile_kernels, argus.perf, argus.singular);
+                                         argus.profile_kernels, argus.perf, argus.singular, pivots);
     }
 
     else
@@ -663,20 +685,21 @@ void testing_sysv(Arguments& argus)
         if(argus.unit_check || argus.norm_check)
             sysv_getError<STRIDED, T>(handle, uplo, n, nrhs, dA, lda, stA, dIpiv, stP, dB, ldb, stB,
                                       dInfo, bc, hA, hARes, hIpiv, hIpivRes, hB, hBRes, hInfo,
-                                      hInfoRes, &max_error, argus.singular);
+                                      hInfoRes, &max_error, argus.singular, pivots);
 
         // collect performance data
         if(argus.timing && hot_calls > 0)
             sysv_getPerfData<STRIDED, T>(handle, uplo, n, nrhs, dA, lda, stA, dIpiv, stP, dB, ldb,
                                          stB, dInfo, bc, hA, hIpiv, hB, hInfo, &gpu_time_used,
                                          &cpu_time_used, hot_calls, argus.profile,
-                                         argus.profile_kernels, argus.perf, argus.singular);
+                                         argus.profile_kernels, argus.perf, argus.singular, pivots);
     }
 
     // validate results for rocsolver-test
-    // using n * machine_precision as tolerance
+    // using n * machine_precision as tolerance (n^2 * machine_precision for the random
+    // indefinite matrices, which are less well conditioned; the pivots are compared exactly)
     if(argus.unit_check)
-        ROCSOLVER_TEST_CHECK(T, max_error, n);
+        ROCSOLVER_TEST_CHECK(T, max_error, (pivots == 'R' ? n * n : n));
 
     // output results for rocsolver-bench
     if(argus.timing)

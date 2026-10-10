@@ -55,6 +55,7 @@ const vector<vector<int>> matrix_size_range = {
     // normal (valid) samples
     {1, 1, 0},
     {1, 1, 1},
+    {2, 2, 0},
     {12, 12, 0},
     {20, 25, 1},
     {33, 50, 0},
@@ -69,6 +70,7 @@ const vector<vector<int64_t>> matrix_size_range_64 = {
     // normal (valid) samples
     {1, 1, 0},
     {1, 1, 1},
+    {2, 2, 0},
     {12, 12, 0},
     {20, 25, 1},
     {33, 50, 0},
