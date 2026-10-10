@@ -45,6 +45,7 @@ using lansy_lanhe_tuple = std::tuple<vector<I>, printable_char, string>;
 // 'N' = random matrix with entries of moderate size,
 // 'B' = entries scaled close to the overflow threshold,
 // 'S' = entries scaled close to the underflow threshold
+// 'Q' = one referenced entry is NaN (the norm must be NaN, as in LAPACK)
 // (the scaled matrices are only used with the Frobenius and max norms)
 
 // case when N == 0, uplo == 'U' and norm_case == "1N" also executes the bad arguments test
@@ -52,7 +53,8 @@ using lansy_lanhe_tuple = std::tuple<vector<I>, printable_char, string>;
 
 const vector<printable_char> uplo_range = {'U', 'L'};
 
-const vector<string> norm_case_range = {"1N", "IN", "FN", "MN", "FB", "FS", "MB", "MS"};
+const vector<string> norm_case_range
+    = {"1N", "IN", "FN", "MN", "FB", "FS", "MB", "MS", "1Q", "IQ", "FQ", "MQ"};
 
 // for checkin_lapack tests
 const vector<vector<int>> matrix_size_range = {
@@ -65,7 +67,8 @@ const vector<vector<int>> matrix_size_range = {
     {1, 1},
     {7, 7},
     {33, 40},
-    {100, 100}};
+    {100, 100},
+    {1100, 1100}};
 
 const vector<vector<int64_t>> matrix_size_range_64 = {
     // quick return
@@ -77,7 +80,8 @@ const vector<vector<int64_t>> matrix_size_range_64 = {
     {1, 1},
     {7, 7},
     {33, 40},
-    {100, 100}};
+    {100, 100},
+    {1100, 1100}};
 
 // for daily_lapack tests
 const vector<vector<int>> large_matrix_size_range

@@ -41,7 +41,8 @@
 
 /* The test-only argument "magnitude" scales the random test matrix close to the overflow ('B')
    or underflow ('S') threshold, so that the squares of the entries overflow or underflow while
-   the norm itself is representable. It is 'N' (no scaling) by default. */
+   the norm itself is representable, or sets one referenced entry to NaN ('Q'; the norm must be
+   NaN, as in LAPACK). It is 'N' (no scaling) by default. */
 template <typename S, typename I>
 S lantr_magnitude_scale(const char magnitude, const I m, const I n)
 {
@@ -179,6 +180,16 @@ void lantr_initData(const rocblas_handle handle,
                     hA[0][i + j * lda] = nan;
                 }
             }
+        }
+
+        // a NaN in the referenced part: the last column of the first row (upper), or the first
+        // column of the last row (lower), if referenced
+        if(magnitude == 'Q' && m > 0 && n > 0)
+        {
+            const I i = (uplo == rocblas_fill_upper) ? 0 : m - 1;
+            const I j = (uplo == rocblas_fill_upper) ? n - 1 : 0;
+            if(!unit || i != j)
+                hA[0][i + j * lda] = nan;
         }
     }
 

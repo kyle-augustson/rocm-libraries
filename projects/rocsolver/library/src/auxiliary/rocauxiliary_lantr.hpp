@@ -178,8 +178,9 @@ __device__ __forceinline__ auto lan_abs(const T& x)
 
 /** Range [lo, hi) of rows of the stored part of column c that lan_cols_kernel visits. For a
     symmetric/Hermitian matrix, the diagonal is included. **/
-template <int KIND, typename I>
-__device__ __forceinline__ void lan_col_range(const bool upper, const I m, const I c, I& lo, I& hi)
+template <int KIND>
+__device__ __forceinline__ void
+    lan_col_range(const bool upper, const int64_t m, const int64_t c, int64_t& lo, int64_t& hi)
 {
     if(KIND == LAN_KIND_GE)
     {
@@ -200,10 +201,11 @@ __device__ __forceinline__ void lan_col_range(const bool upper, const I m, const
 
 /** Range [lo, hi) of columns of the stored part of row r that lan_rows_kernel visits. For a
     symmetric/Hermitian matrix, the diagonal is excluded (it is counted by the column sums). **/
-template <int KIND, typename I>
-__device__ __forceinline__ void lan_row_range(const bool upper, const I n, const I r, I& lo, I& hi)
+template <int KIND>
+__device__ __forceinline__ void
+    lan_row_range(const bool upper, const int64_t n, const int64_t r, int64_t& lo, int64_t& hi)
 {
-    constexpr I d = LAN_SYMMETRIC(KIND) ? 1 : 0;
+    constexpr int64_t d = LAN_SYMMETRIC(KIND) ? 1 : 0;
     if(KIND == LAN_KIND_GE)
     {
         lo = 0;
@@ -290,37 +292,38 @@ ROCSOLVER_KERNEL void __launch_bounds__(LAN_BX* LAN_BY) lan_cols_kernel(const bo
     // the medium accumulator (or the sum or the maximum), then the big and small accumulators
     __shared__ S sacc[3][LAN_BY][LAN_BX];
 
-    const I rs = h * rchunk;
-    const I re = std::min(rs + rchunk, m);
+    // the indices are computed in 64 bits, as they can exceed the range of I near its end
+    const int64_t rs = int64_t(h) * rchunk;
+    const int64_t re = std::min<int64_t>(rs + rchunk, m);
 
-    for(I cb = blockIdx.x; cb < ncb; cb += gridDim.x)
+    for(int64_t cb = blockIdx.x; cb < ncb; cb += gridDim.x)
     {
-        const I c = cb * LAN_BY + ty;
+        const int64_t c = cb * LAN_BY + ty;
         S acc = 0, abig = 0, asml = 0;
 
         if(c < n)
         {
-            I lo, hi;
+            int64_t lo, hi;
             lan_col_range<KIND>(upper, m, c, lo, hi);
             lo = std::max(lo, rs);
             hi = std::min(hi, re);
 
             // four independent loads per iteration, then the remaining rows
             const T* ac = a + idx2D(0, c, lda);
-            I r = lo + tx;
+            int64_t r = lo + tx;
             for(; r + 3 * LAN_BX < hi; r += 4 * LAN_BX)
             {
                 const T x0 = ac[r];
                 const T x1 = ac[r + LAN_BX];
                 const T x2 = ac[r + 2 * LAN_BX];
                 const T x3 = ac[r + 3 * LAN_BX];
-                lan_col_add<KIND, NORM, T, I, S>(unit, r, c, x0, acc, abig, asml);
-                lan_col_add<KIND, NORM, T, I, S>(unit, r + LAN_BX, c, x1, acc, abig, asml);
-                lan_col_add<KIND, NORM, T, I, S>(unit, r + 2 * LAN_BX, c, x2, acc, abig, asml);
-                lan_col_add<KIND, NORM, T, I, S>(unit, r + 3 * LAN_BX, c, x3, acc, abig, asml);
+                lan_col_add<KIND, NORM, T, int64_t, S>(unit, r, c, x0, acc, abig, asml);
+                lan_col_add<KIND, NORM, T, int64_t, S>(unit, r + LAN_BX, c, x1, acc, abig, asml);
+                lan_col_add<KIND, NORM, T, int64_t, S>(unit, r + 2 * LAN_BX, c, x2, acc, abig, asml);
+                lan_col_add<KIND, NORM, T, int64_t, S>(unit, r + 3 * LAN_BX, c, x3, acc, abig, asml);
             }
             for(; r < hi; r += LAN_BX)
-                lan_col_add<KIND, NORM, T, I, S>(unit, r, c, ac[r], acc, abig, asml);
+                lan_col_add<KIND, NORM, T, int64_t, S>(unit, r, c, ac[r], acc, abig, asml);
         }
 
         // reduce over tx (in a fixed order)
@@ -390,19 +393,20 @@ ROCSOLVER_KERNEL void __launch_bounds__(LAN_BX* LAN_BY) lan_rows_kernel(const bo
 
     __shared__ S ssum[LAN_BY][LAN_BX];
 
-    const I cs = h * cchunk;
-    const I ce = std::min(cs + cchunk, n);
+    // the indices are computed in 64 bits, as they can exceed the range of I near its end
+    const int64_t cs = int64_t(h) * cchunk;
+    const int64_t ce = std::min<int64_t>(cs + cchunk, n);
 
-    for(I rb = blockIdx.x; rb < nrb; rb += gridDim.x)
+    for(int64_t rb = blockIdx.x; rb < nrb; rb += gridDim.x)
     {
-        const I r0 = rb * LAN_BX;
-        const I r = r0 + tx;
-        const I rlast = std::min(r0 + LAN_BX, m) - 1;
+        const int64_t r0 = rb * LAN_BX;
+        const int64_t r = r0 + tx;
+        const int64_t rlast = std::min<int64_t>(r0 + LAN_BX, m) - 1;
 
         // the columns visited by the block (the same for all its threads, so that the reads of
         // each column are coalesced); each thread only adds those of its own row. The start of
         // the range of a row does not decrease with the row, and neither does its end.
-        I lo, hi, rlo, rhi;
+        int64_t lo, hi, rlo, rhi;
         lan_row_range<KIND>(upper, n, r0, lo, rhi);
         lan_row_range<KIND>(upper, n, rlast, rlo, hi);
         lo = std::max(lo, cs);
@@ -414,7 +418,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(LAN_BX* LAN_BY) lan_rows_kernel(const bo
 
         // adds the element of column c (if it is in the row)
         S sum = 0;
-        auto add = [&](const I c) __attribute__((always_inline))
+        auto add = [&](const int64_t c) __attribute__((always_inline))
         {
             if(c >= rlo && c < rhi)
             {
@@ -426,7 +430,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(LAN_BX* LAN_BY) lan_rows_kernel(const bo
         };
 
         // four columns per iteration, then the remaining columns
-        I c = lo + ty;
+        int64_t c = lo + ty;
         for(; c + 3 * LAN_BY < hi; c += 4 * LAN_BY)
         {
             add(c);
@@ -474,10 +478,10 @@ ROCSOLVER_KERNEL void __launch_bounds__(LAN_FINAL_THDS)
     if constexpr(NORM == LAN_NORM_SUM)
     {
         const bool rows = (!LAN_SYMMETRIC(KIND) && norm_type == rocsolver_norm_type_infinity);
-        const I len = rows ? m : n;
+        const int64_t len = rows ? m : n;
         const S* cp = colpart + rocblas_stride(b) * nrch * n;
         const S* rp = rowpart + rocblas_stride(b) * ncch * m;
-        for(I k = tid; k < len; k += LAN_FINAL_THDS)
+        for(int64_t k = tid; k < len; k += LAN_FINAL_THDS)
         {
             S sum = 0;
             if(!rows)
@@ -653,8 +657,11 @@ rocblas_status rocsolver_lan_template(rocblas_handle handle,
     S* rowpart = work + (need_cols ? nacc * psize : 0);
 
     dim3 threads(LAN_BX, LAN_BY, 1);
-    const I ncb = I(std::min<int64_t>((int64_t(n) - 1) / LAN_BY + 1, maxgrid));
-    const I nrb = I(std::min<int64_t>((int64_t(m) - 1) / LAN_BX + 1, maxgrid));
+    // the kernels loop over the blocks beyond the grid; the number of threads in each dimension
+    // of the grid must be less than 2^32
+    const int64_t maxblocks = std::min<int64_t>(maxgrid, ((int64_t(1) << 32) - 1) / LAN_BX);
+    const I ncb = I(std::min<int64_t>((int64_t(n) - 1) / LAN_BY + 1, maxblocks));
+    const I nrb = I(std::min<int64_t>((int64_t(m) - 1) / LAN_BX + 1, maxblocks));
     dim3 gridc(ncb, nrch, batch_count);
     dim3 gridr(nrb, ncch, batch_count);
     dim3 gridf(1, 1, batch_count);

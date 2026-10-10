@@ -167,6 +167,14 @@ void lansy_lanhe_initData(const rocblas_handle handle,
                 }
             }
         }
+
+        // magnitude 'Q': a NaN in the stored triangle (the norm must be NaN, as in LAPACK)
+        if(magnitude == 'Q' && n > 0)
+        {
+            const I i = (uplo == rocblas_fill_upper) ? 0 : n - 1;
+            const I j = (uplo == rocblas_fill_upper) ? n - 1 : 0;
+            hA[0][i + j * lda] = nan;
+        }
     }
 
     if(GPU)

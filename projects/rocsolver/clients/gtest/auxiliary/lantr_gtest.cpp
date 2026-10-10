@@ -47,6 +47,7 @@ using lantr_tuple = std::tuple<vector<I>, printable_char, printable_char, string
 // 'N' = random matrix with entries of moderate size,
 // 'B' = entries scaled close to the overflow threshold,
 // 'S' = entries scaled close to the underflow threshold
+// 'Q' = one referenced entry is NaN (the norm must be NaN, as in LAPACK)
 // (the scaled matrices are only used with the Frobenius and max norms)
 
 // case when M == 0, uplo == 'U', diag == 'N' and norm_case == "1N" also executes the bad
@@ -56,7 +57,8 @@ const vector<printable_char> uplo_range = {'U', 'L'};
 
 const vector<printable_char> diag_range = {'N', 'U'};
 
-const vector<string> norm_case_range = {"1N", "IN", "FN", "MN", "FB", "FS", "MB", "MS"};
+const vector<string> norm_case_range
+    = {"1N", "IN", "FN", "MN", "FB", "FS", "MB", "MS", "1Q", "IQ", "FQ", "MQ"};
 
 // for checkin_lapack tests
 const vector<vector<int>> matrix_size_range = {
@@ -74,7 +76,8 @@ const vector<vector<int>> matrix_size_range = {
     {15, 33, 20},
     {33, 33, 40},
     {100, 60, 100},
-    {60, 100, 64}};
+    {60, 100, 64},
+    {1500, 40, 1500}};
 
 const vector<vector<int64_t>> matrix_size_range_64 = {
     // quick return
@@ -91,7 +94,8 @@ const vector<vector<int64_t>> matrix_size_range_64 = {
     {15, 33, 20},
     {33, 33, 40},
     {100, 60, 100},
-    {60, 100, 64}};
+    {60, 100, 64},
+    {1500, 40, 1500}};
 
 // for daily_lapack tests
 const vector<vector<int>> large_matrix_size_range
