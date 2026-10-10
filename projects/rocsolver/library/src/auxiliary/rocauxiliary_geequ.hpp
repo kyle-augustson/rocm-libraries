@@ -77,14 +77,36 @@ __device__ __forceinline__ auto equ_cabs1(const T& x)
         return rocblas_abs(x);
 }
 
-/** RADIX**INT(LOG(x) / LOG(RADIX)) with RADIX = 2 (as in xGEEQUB), computed exactly: the base-2
-    exponent of x truncated toward zero. **/
+/** LOG(x) as LAPACK's xGEEQUB and xPOEQUB evaluate it. Their results depend on its last bit when x
+    is (close to) a power of 2. In single precision, the logarithm is computed in double precision
+    and rounded, which gives the correctly rounded value as the host libraries do; in double
+    precision, log() gives the same values as the host libraries at the powers of 2. **/
 template <typename S>
+__device__ __forceinline__ S equ_log(const S x)
+{
+    if constexpr(std::is_same_v<S, float>)
+        return float(log(double(x)));
+    else
+        return log(x);
+}
+
+/** RADIX**INT(LOG(x) / LOG(RADIX)) (POEQUB = false, as in xGEEQUB) or
+    RADIX**INT(TMP * LOG(x)) with TMP = -0.5 / LOG(RADIX) (POEQUB = true, as in xPOEQUB), with
+    RADIX = 2, evaluated as LAPACK does: in precision S, with the exponent truncated toward zero.
+    As in LAPACK, RADIX**e with e < 0 is 1 / RADIX**(-e), which is zero if RADIX**(-e) overflows.
+    x > 0. **/
+template <bool POEQUB, typename S>
 __device__ __forceinline__ S equ_pow2(const S x)
 {
-    int e = ilogb(x);
-    if(x < 1 && x != ldexp(S(1), e))
-        e++;
+    const S logrdx = S(0x1.62e42fefa39efp-1);
+    S t;
+    if(POEQUB)
+        t = (S(-0.5) / logrdx) * equ_log(x);
+    else
+        t = equ_log(x) / logrdx;
+    const int e = int(t);
+    if(e <= -std::numeric_limits<S>::max_exponent)
+        return 0;
     return ldexp(S(1), e);
 }
 
@@ -112,17 +134,18 @@ ROCSOLVER_KERNEL void __launch_bounds__(EQU_BX* EQU_BY) equ_rows_kernel(const I 
 
     __shared__ S smax[EQU_BY][EQU_BX];
 
-    const I cs = h * cchunk;
-    const I ce = std::min(cs + cchunk, n);
+    // the indices are computed in 64 bits, as they can exceed the range of I near its end
+    const int64_t cs = int64_t(h) * cchunk;
+    const int64_t ce = std::min<int64_t>(cs + cchunk, n);
 
-    for(I rb = blockIdx.x; rb < nrb; rb += gridDim.x)
+    for(int64_t rb = blockIdx.x; rb < nrb; rb += gridDim.x)
     {
-        const I r = rb * EQU_BX + tx;
+        const int64_t r = rb * EQU_BX + tx;
 
         S v = 0;
         if(r < m)
         {
-            I c = cs + ty;
+            int64_t c = cs + ty;
             for(; c + 3 * EQU_BY < ce; c += 4 * EQU_BY)
             {
                 const S x0 = equ_cabs1(a[idx2D(r, c, lda)]);
@@ -165,7 +188,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(EQU_FINAL_THDS)
 {
     const I b = blockIdx.z;
     const I tid = threadIdx.x;
-    const I len = ROW ? m : n;
+    const int64_t len = ROW ? m : n;
 
     if(!ROW && info[b] != 0)
         return;
@@ -177,18 +200,18 @@ ROCSOLVER_KERNEL void __launch_bounds__(EQU_FINAL_THDS)
     S* rc = RC + b * strideRC;
 
     __shared__ S smin[EQU_FINAL_THDS], smx[EQU_FINAL_THDS];
-    __shared__ I szero[EQU_FINAL_THDS];
+    __shared__ int64_t szero[EQU_FINAL_THDS];
 
     // maxima, rounded to powers of 2 for xGEEQUB, and their extremes
     S vmin = bignum, vmax = 0;
-    I zero = len;
-    for(I k = tid; k < len; k += EQU_FINAL_THDS)
+    int64_t zero = len;
+    for(int64_t k = tid; k < len; k += EQU_FINAL_THDS)
     {
         S v = 0;
         for(I h = 0; h < nch; h++)
             v = std::max(v, p[rocblas_stride(h) * len + k]);
         if(POW2 && v > 0)
-            v = equ_pow2(v);
+            v = equ_pow2<false>(v);
         rc[k] = v;
         vmin = std::min(vmin, v);
         vmax = std::max(vmax, v);
@@ -225,7 +248,7 @@ ROCSOLVER_KERNEL void __launch_bounds__(EQU_FINAL_THDS)
         return;
     }
 
-    for(I k = tid; k < len; k += EQU_FINAL_THDS)
+    for(int64_t k = tid; k < len; k += EQU_FINAL_THDS)
         rc[k] = S(1) / std::min(std::max(rc[k], smlnum), bignum);
 
     if(tid == 0)
@@ -267,18 +290,19 @@ ROCSOLVER_KERNEL void __launch_bounds__(EQU_BX* EQU_BY) equ_cols_kernel(const I 
 
     __shared__ S smax[EQU_BY][EQU_BX];
 
-    const I rs = h * rchunk;
-    const I re = std::min(rs + rchunk, m);
+    // the indices are computed in 64 bits, as they can exceed the range of I near its end
+    const int64_t rs = int64_t(h) * rchunk;
+    const int64_t re = std::min<int64_t>(rs + rchunk, m);
 
-    for(I cb = blockIdx.x; cb < ncb; cb += gridDim.x)
+    for(int64_t cb = blockIdx.x; cb < ncb; cb += gridDim.x)
     {
-        const I c = cb * EQU_BY + ty;
+        const int64_t c = cb * EQU_BY + ty;
 
         S v = 0;
         if(c < n)
         {
             const T* ac = a + idx2D(0, c, lda);
-            I i = rs + tx;
+            int64_t i = rs + tx;
             for(; i + 3 * EQU_BX < re; i += 4 * EQU_BX)
             {
                 const S x0 = equ_cabs1(ac[i]) * r[i];
@@ -432,8 +456,11 @@ rocblas_status rocsolver_geequ_template(rocblas_handle handle,
     S* colpart = work + size_t(ncch) * m * batch_count;
 
     dim3 threads(EQU_BX, EQU_BY, 1);
-    const I nrb = I(std::min<int64_t>((int64_t(m) - 1) / EQU_BX + 1, maxgrid));
-    const I ncb = I(std::min<int64_t>((int64_t(n) - 1) / EQU_BY + 1, maxgrid));
+    // the kernels loop over the blocks beyond the grid; the number of threads in each dimension
+    // of the grid must be less than 2^32
+    const int64_t maxblocks = std::min<int64_t>(maxgrid, ((int64_t(1) << 32) - 1) / EQU_BX);
+    const I nrb = I(std::min<int64_t>((int64_t(m) - 1) / EQU_BX + 1, maxblocks));
+    const I ncb = I(std::min<int64_t>((int64_t(n) - 1) / EQU_BY + 1, maxblocks));
 
     // row scale factors, rowcnd, amax, info (zero rows)
     ROCSOLVER_LAUNCH_KERNEL((equ_rows_kernel<T>), dim3(nrb, ncch, batch_count), threads, 0, stream,

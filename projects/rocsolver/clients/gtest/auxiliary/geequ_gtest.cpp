@@ -42,6 +42,9 @@ using geequ_tuple = std::tuple<vector<I>, char>;
 // 'N': entries of normal magnitude (rows and columns scaled by up to 2^20),
 // 'L': same, with the largest entries close to overflow,
 // 'S': same, with the smallest entries close to underflow,
+// 'P': same as 'N', with all magnitudes exact powers of 2 (where LAPACK's rounding of the
+//      logarithms in xGEEQUB/xPOEQUB matters),
+// 'D': same, with the largest magnitudes subnormal,
 // 'R': a zero row (in the middle),
 // 'C': a zero column (the last one),
 // 'B': a zero row (the last one) and a zero column (the first one)
@@ -49,7 +52,7 @@ using geequ_tuple = std::tuple<vector<I>, char>;
 // case when M == 0 and case == 'N' also executes the bad arguments test
 // (null handle, null pointers and invalid values)
 
-const vector<char> case_range = {'N', 'L', 'S', 'R', 'C', 'B'};
+const vector<char> case_range = {'N', 'L', 'S', 'P', 'D', 'R', 'C', 'B'};
 
 // for checkin_lapack tests
 const vector<vector<int>> matrix_size_range = {
@@ -115,7 +118,7 @@ Arguments geequ_setup_arguments(geequ_tuple<I> tup)
     char scale = 'N';
     I zero_row = 0;
     I zero_col = 0;
-    if(test_case == 'L' || test_case == 'S')
+    if(test_case == 'L' || test_case == 'S' || test_case == 'P' || test_case == 'D')
         scale = test_case;
     else if(test_case == 'R')
         zero_row = (m + 1) / 2;

@@ -101,10 +101,12 @@ ROCSOLVER_KERNEL void __launch_bounds__(LAQ_BX* LAQ_BY) laqge_kernel(const I m,
     const bool rows = (eq != rocsolver_equilibration_column);
     const bool cols = (eq != rocsolver_equilibration_row);
 
-    for(I j = blockIdx.y * I(LAQ_BY) + threadIdx.y; j < n; j += I(gridDim.y) * LAQ_BY)
+    for(int64_t j = blockIdx.y * int64_t(LAQ_BY) + threadIdx.y; j < n;
+        j += int64_t(gridDim.y) * LAQ_BY)
     {
         const S cj = cols ? c[j] : S(1);
-        for(I i = blockIdx.x * I(LAQ_BX) + threadIdx.x; i < m; i += I(gridDim.x) * LAQ_BX)
+        for(int64_t i = blockIdx.x * int64_t(LAQ_BX) + threadIdx.x; i < m;
+            i += int64_t(gridDim.x) * LAQ_BX)
         {
             // the products are formed in the order of LAPACK
             S f;
@@ -147,10 +149,12 @@ ROCSOLVER_KERNEL void __launch_bounds__(LAQ_BX* LAQ_BY) laqsy_kernel(const bool 
     T* a = load_ptr_batch<T>(A, b, shiftA, strideA);
     const S* s = Sc + b * strideS;
 
-    for(I j = blockIdx.y * I(LAQ_BY) + threadIdx.y; j < n; j += I(gridDim.y) * LAQ_BY)
+    for(int64_t j = blockIdx.y * int64_t(LAQ_BY) + threadIdx.y; j < n;
+        j += int64_t(gridDim.y) * LAQ_BY)
     {
         const S cj = s[j];
-        for(I i = blockIdx.x * I(LAQ_BX) + threadIdx.x; i < n; i += I(gridDim.x) * LAQ_BX)
+        for(int64_t i = blockIdx.x * int64_t(LAQ_BX) + threadIdx.x; i < n;
+            i += int64_t(gridDim.x) * LAQ_BX)
         {
             if(upper ? (i > j) : (i < j))
                 continue;

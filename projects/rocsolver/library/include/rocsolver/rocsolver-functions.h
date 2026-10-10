@@ -279,7 +279,8 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zlacgv_64(rocblas_handle handle,
     @param[out]
     info        pointer to a rocblas_int on the GPU.
                 If info = 0, successful exit.
-                If info = i > 0 and i <= m, the i-th row of A is exactly zero.
+                If info = i > 0 and i <= m, the i-th row of A is exactly zero (NaN elements are
+                not taken into account).
                 If info = i > m, the (i-m)-th column of A is exactly zero.
     *************************************************************************/
 
@@ -389,7 +390,10 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zgeequ_64(rocblas_handle handle,
     \f$B = \text{diag}(R)\, A\, \text{diag}(C)\f$ is in the interval \f$(1/2, 2)\f$.
     The scaling factors are powers of 2, so that the scaling does not introduce rounding errors.
     Unlike \ref rocsolver_sgeequ "GEEQU", this does not necessarily make the largest elements equal to
-    1, but it reduces their range, as in LAPACK's xGEEQUB.
+    1, but it reduces their range. The powers of 2 are computed with the formula of LAPACK's xGEEQUB,
+    2**INT(LOG(x)/LOG(2)) evaluated in floating point, so that the results are those of LAPACK: at
+    some exact powers of 2, the rounding of the quotient gives the neighbouring power of 2, and a row
+    or column whose largest element is subnormal can get a zero scaling factor (and info > 0).
 
     ROWCND is the ratio of the smallest to the largest scaling factor of R; if ROWCND >= 0.1 and AMAX
     is neither too large nor too small, it is not worth scaling by R. COLCND is the same ratio for C.
@@ -428,11 +432,13 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zgeequ_64(rocblas_handle handle,
                 It is one if m = 0 or n = 0.
     @param[out]
     amax        pointer to real type. Scalar on the GPU.
-                The largest absolute value of any element of A. It is zero if m = 0 or n = 0.
+                The largest of the row maxima of A, each rounded to a power of 2 as the scaling
+                factors are (as in LAPACK). It is zero if m = 0 or n = 0.
     @param[out]
     info        pointer to a rocblas_int on the GPU.
                 If info = 0, successful exit.
-                If info = i > 0 and i <= m, the i-th row of A is exactly zero.
+                If info = i > 0 and i <= m, the i-th row of A is exactly zero (NaN elements are
+                not taken into account).
                 If info = i > m, the (i-m)-th column of A is exactly zero.
     *************************************************************************/
 
@@ -653,8 +659,10 @@ ROCSOLVER_EXPORT rocblas_status rocsolver_zpoequ_64(rocblas_handle handle,
 
     \details
     The scaling factors S are computed from the diagonal of A, as \f$1/\sqrt{A_{ii}}\f$ rounded to
-    a power of 2 (its base-2 exponent is truncated toward zero, as in LAPACK's xPOEQUB), so that
-    \f$B = \text{diag}(S)\, A\, \text{diag}(S)\f$ has a nearly unit diagonal. This choice of S puts the
+    a power of 2 with the formula of LAPACK's xPOEQUB, 2**INT(-0.5*LOG(A_ii)/LOG(2)) evaluated in
+    floating point (as in LAPACK, at some exact powers of 2 the rounding gives the neighbouring power),
+    so that \f$B = \text{diag}(S)\, A\, \text{diag}(S)\f$ has a nearly unit diagonal. This choice of S
+    puts the
     condition number of B within a factor n of the smallest possible condition number over all
     possible diagonal scalings. Only the diagonal of A is referenced (for the complex versions, only
     its real part).

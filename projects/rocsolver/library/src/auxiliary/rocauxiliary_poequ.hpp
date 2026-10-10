@@ -57,12 +57,12 @@ ROCSOLVER_KERNEL void __launch_bounds__(EQU_FINAL_THDS) poequ_kernel(const I n,
     S* s = Sc + b * strideS;
 
     __shared__ S smin[EQU_FINAL_THDS], smx[EQU_FINAL_THDS];
-    __shared__ I sbad[EQU_FINAL_THDS];
+    __shared__ int64_t sbad[EQU_FINAL_THDS];
 
     // diagonal (real part), its extremes and the first nonpositive element
     S vmin = std::numeric_limits<S>::max(), vmax = std::numeric_limits<S>::lowest();
-    I bad = n;
-    for(I i = tid; i < n; i += EQU_FINAL_THDS)
+    int64_t bad = n;
+    for(int64_t i = tid; i < n; i += EQU_FINAL_THDS)
     {
         const S v = std::real(a[idx2D(i, i, lda)]);
         s[i] = v;
@@ -100,10 +100,10 @@ ROCSOLVER_KERNEL void __launch_bounds__(EQU_FINAL_THDS) poequ_kernel(const I n,
     if(bad < n)
         return;
 
-    for(I i = tid; i < n; i += EQU_FINAL_THDS)
+    for(int64_t i = tid; i < n; i += EQU_FINAL_THDS)
     {
         if(POW2)
-            s[i] = ldexp(S(1), int(S(-0.5) * log2(s[i])));
+            s[i] = equ_pow2<true>(s[i]);
         else
             s[i] = S(1) / sqrt(s[i]);
     }

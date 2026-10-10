@@ -42,13 +42,16 @@ using poequ_tuple = std::tuple<vector<I>, char>;
 // 'N': positive diagonal of normal magnitude (spanning 2^-40 to 2^40),
 // 'L': same, with the largest elements close to overflow,
 // 'S': same, with the smallest elements close to underflow,
+// 'P': same as 'N', with all magnitudes exact powers of 2 (where LAPACK's rounding of the
+//      logarithms in xGEEQUB/xPOEQUB matters),
+// 'D': same, with the largest magnitudes subnormal,
 // 'Z': a zero diagonal element (in the middle),
 // 'M': a negative diagonal element (the last one)
 
 // case when N == 0 and case == 'N' also executes the bad arguments test
 // (null handle, null pointers and invalid values)
 
-const vector<char> case_range = {'N', 'L', 'S', 'Z', 'M'};
+const vector<char> case_range = {'N', 'L', 'S', 'P', 'D', 'Z', 'M'};
 
 // for checkin_lapack tests
 const vector<vector<int>> matrix_size_range = {
@@ -100,7 +103,7 @@ Arguments poequ_setup_arguments(poequ_tuple<I> tup)
     char scale = 'N';
     I zero_diag = 0;
     I neg_diag = 0;
-    if(test_case == 'L' || test_case == 'S')
+    if(test_case == 'L' || test_case == 'S' || test_case == 'P' || test_case == 'D')
         scale = test_case;
     else if(test_case == 'Z')
         zero_diag = (n + 1) / 2;

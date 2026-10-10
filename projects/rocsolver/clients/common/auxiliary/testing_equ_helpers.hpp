@@ -59,10 +59,15 @@ inline double equ_rand_sign()
     return equ_rand_int(0, 1) ? 1.0 : -1.0;
 }
 
-// random positive value u * 2^e, with u in [0.55, 0.95]
+// when set, the generated magnitudes are exact powers of 2 (test case 'P')
+inline bool equ_exact_powers = false;
+
+// random positive value u * 2^e, with u in [0.55, 0.95] (or u = 1 if equ_exact_powers is set)
 template <typename S>
 S equ_positive(int e)
 {
+    if(equ_exact_powers)
+        return std::ldexp(S(1), e);
     S u = S(std::uniform_real_distribution<double>(0.55, 0.95)(rocblas_rng));
     return std::ldexp(u, e);
 }
@@ -87,7 +92,9 @@ T equ_element(int e)
     S t = equ_positive<S>(e);
     if constexpr(rocblas_is_complex<T>)
     {
-        S p = t * S(std::uniform_real_distribution<double>(0.5, 0.8)(rocblas_rng));
+        S p = equ_exact_powers
+            ? t * S(0.75)
+            : t * S(std::uniform_real_distribution<double>(0.5, 0.8)(rocblas_rng));
         S q = t - p;
         if(equ_rand_int(0, 1))
             std::swap(p, q);
@@ -98,12 +105,15 @@ T equ_element(int e)
 }
 
 /* Exponent offset of the generated values, whose exponents (before the offset) lie in
-   [-range, range]: 'N' keeps the magnitudes around 1, 'L' moves the largest magnitude close to
-   2^(max_exponent - 8) (near overflow), and 'S' moves the smallest magnitude close to
-   2^(min_exponent + 8) (near underflow). */
+   [-range, range]: 'N' and 'P' keep the magnitudes around 1, 'L' moves the largest magnitude close
+   to 2^(max_exponent - 8) (near overflow), 'S' moves the smallest magnitude close to
+   2^(min_exponent + 8) (near underflow), and 'D' makes the largest magnitudes subnormal (some
+   elements may underflow to zero). */
 template <typename S>
 int equ_shift(const char scale, const int range)
 {
+    if(scale == 'D')
+        return std::numeric_limits<S>::min_exponent - 2 - range;
     if(scale == 'L')
         return std::numeric_limits<S>::max_exponent - 8 - range;
     if(scale == 'S')
@@ -155,6 +165,7 @@ void equ_init_general(T* A,
 {
     using S = decltype(std::real(T{}));
     const int shift = equ_shift<S>(scale, equ_spread);
+    equ_exact_powers = (scale == 'P');
 
     std::vector<int> r(m), c(n);
     for(auto& e : r)
@@ -174,6 +185,7 @@ void equ_init_general(T* A,
         for(I i = m; i < lda; i++)
             A[i + j * lda] = nan_padding ? equ_nan<T>() : equ_make<T>(equ_huge<S>(), equ_huge<S>());
     }
+    equ_exact_powers = false;
 }
 
 /* Fills the n-by-n matrix A with a positive diagonal of magnitudes u * 2^e, with e in
@@ -187,6 +199,7 @@ void equ_init_diagonal(T* A, const I n, const I lda, const char scale, const I z
     using S = decltype(std::real(T{}));
     const int shift = equ_shift<S>(scale, 2 * equ_spread);
     const S big = equ_huge<S>();
+    equ_exact_powers = (scale == 'P');
 
     for(I j = 0; j < n; j++)
     {
@@ -207,6 +220,7 @@ void equ_init_diagonal(T* A, const I n, const I lda, const char scale, const I z
                 A[i + j * lda] = equ_nan<T>();
         }
     }
+    equ_exact_powers = false;
 }
 
 /* Fills the triangle uplo of the n-by-n matrix A with random entries: the diagonal has a positive real
