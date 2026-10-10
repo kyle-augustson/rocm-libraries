@@ -41,7 +41,8 @@
 ROCSOLVER_BEGIN_NAMESPACE
 
 /*
- * Norms of trapezoidal (LANTR), symmetric (LANSY) and Hermitian (LANHE) matrices.
+ * Norms of general (LANGE), trapezoidal (LANTR), symmetric (LANSY) and Hermitian (LANHE)
+ * matrices.
  *
  * Only the stored part of the matrix is read. The column sums, maxima and scaled sums of squares are
  * computed by lan_cols_kernel (each group of LAN_BX threads goes down one column, so the reads
@@ -64,6 +65,7 @@ ROCSOLVER_BEGIN_NAMESPACE
 #define LAN_KIND_TR 0
 #define LAN_KIND_SY 1
 #define LAN_KIND_HE 2
+#define LAN_KIND_GE 3
 
 // symmetric or Hermitian: only one triangle is stored
 #define LAN_SYMMETRIC(KIND) ((KIND) == LAN_KIND_SY || (KIND) == LAN_KIND_HE)
@@ -179,7 +181,12 @@ __device__ __forceinline__ auto lan_abs(const T& x)
 template <int KIND, typename I>
 __device__ __forceinline__ void lan_col_range(const bool upper, const I m, const I c, I& lo, I& hi)
 {
-    if(upper)
+    if(KIND == LAN_KIND_GE)
+    {
+        lo = 0;
+        hi = m;
+    }
+    else if(upper)
     {
         lo = 0;
         hi = std::min(c + 1, m);
@@ -197,7 +204,12 @@ template <int KIND, typename I>
 __device__ __forceinline__ void lan_row_range(const bool upper, const I n, const I r, I& lo, I& hi)
 {
     constexpr I d = LAN_SYMMETRIC(KIND) ? 1 : 0;
-    if(upper)
+    if(KIND == LAN_KIND_GE)
+    {
+        lo = 0;
+        hi = n;
+    }
+    else if(upper)
     {
         lo = r + d;
         hi = n;
