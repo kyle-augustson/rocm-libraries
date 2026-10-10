@@ -20,6 +20,10 @@ Full documentation for rocSOLVER is available at the [rocSOLVER documentation](h
 * Improved performance of expert eigensolvers SYEVDX/HEEVDX, SYGVDX/HEGVDX
 
 ### Resolved issues
+
+* SYTRS returned wrong solutions, or NaN, for some matrices when nrhs >= n/2 (the case that uses the
+  algorithm of xSYTRS2): the row interchanges and the 2-by-2 diagonal blocks were applied in the
+  wrong order
 ### Known issues
 ### Upcoming changes
 
