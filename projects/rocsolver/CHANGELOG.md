@@ -10,6 +10,9 @@ Full documentation for rocSOLVER is available at the [rocSOLVER documentation](h
 * Hessenberg reduction routines
     * GEHD2
     * GEHRD
+* Symmetric indefinite systems: SYSV (with batched and strided\_batched versions), and the
+  condition number estimate SYCON and SYCON_64
+* Matrix copy: LACPY and LACPY_64
 
 * Support added for the gfx1250-strict architecture.
 
