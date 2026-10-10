@@ -28,6 +28,7 @@ Full documentation for rocSOLVER is available at the [rocSOLVER documentation](h
   choose the pivot was read while it was being interchanged), which gave wrong factorizations, and
   memory access faults, for some matrices
 * SYTF2 and SYTRF report a NaN pivot in info, as LAPACK's xSYTF2, instead of reading out of bounds
+* GECON could return a wrong estimate, or hang, for n > 64 (a race in its LACN2 iteration)
 ### Known issues
 ### Upcoming changes
 
