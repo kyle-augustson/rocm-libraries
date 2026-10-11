@@ -36,7 +36,8 @@ using namespace std;
 template <typename I>
 using pocon_tuple = std::tuple<vector<I>, printable_char>;
 
-// each size_range vector is a {N, lda}
+// each size_range vector is a {N, lda}, or {N, lda, 1} to run with the handle in device
+// pointer mode
 
 // each uplo is one of: 'U', 'L'
 
@@ -57,7 +58,9 @@ const vector<vector<int>> matrix_size_range = {
     {7, 7},
     {20, 25},
     {33, 50},
-    {100, 100}};
+    {100, 100},
+    // device pointer mode (with n large enough for rocBLAS to be called)
+    {500, 500, 1}};
 
 const vector<vector<int64_t>> matrix_size_range_64 = {
     // quick return
@@ -70,7 +73,9 @@ const vector<vector<int64_t>> matrix_size_range_64 = {
     {7, 7},
     {20, 25},
     {33, 50},
-    {100, 100}};
+    {100, 100},
+    // device pointer mode (with n large enough for rocBLAS to be called)
+    {500, 500, 1}};
 
 // for daily_lapack tests
 const vector<vector<int>> large_matrix_size_range
@@ -90,6 +95,10 @@ Arguments pocon_setup_arguments(pocon_tuple<I> tup)
     arg.set<I>("n", matrix_size[0]);
     arg.set<I>("lda", matrix_size[1]);
     arg.set<char>("uplo", uplo);
+
+    // device pointer mode
+    if(matrix_size.size() > 2 && matrix_size[2] == 1)
+        arg.set<char>("pointer_mode", 'D');
 
     arg.timing = 0;
 

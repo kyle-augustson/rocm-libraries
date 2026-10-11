@@ -201,6 +201,9 @@ rocblas_status rocsolver_con_estimate(rocblas_handle handle,
 
     HIP_CHECK(hipMemsetAsync(d_flag, 0, sizeof(rocblas_int), stream));
 
+    // the triangular solves pass their scalars on the host
+    rocblas_pointer_mode_saver saver(handle, rocblas_pointer_mode_host);
+
     T* x = work_x;
     T* v = work_v;
     const bool upper = (uplo == rocblas_fill_upper);

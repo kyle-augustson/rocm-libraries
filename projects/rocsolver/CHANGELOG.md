@@ -34,6 +34,7 @@ Full documentation for rocSOLVER is available at the [rocSOLVER documentation](h
 
 * LANGE now sets the norm to zero when m = 0 or n = 0, accumulates the Frobenius norm with scaling
   to avoid overflow and underflow, and returns NaN for complex elements with a NaN real part
+
 ### Known issues
 ### Upcoming changes
 

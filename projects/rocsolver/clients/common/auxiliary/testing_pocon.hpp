@@ -253,6 +253,10 @@ void testing_pocon(Arguments& argus)
     I n = argus.get<I>("n");
     I lda = argus.get<I>("lda", n);
 
+    // the handle can be in device pointer mode (the API scalars are on the device in both modes)
+    if(argus.get<char>("pointer_mode", 'H') == 'D')
+        CHECK_ROCBLAS_ERROR(rocblas_set_pointer_mode(handle, rocblas_pointer_mode_device));
+
     rocblas_fill uplo = char2rocblas_fill(uploC);
     rocblas_int hot_calls = argus.iters;
 

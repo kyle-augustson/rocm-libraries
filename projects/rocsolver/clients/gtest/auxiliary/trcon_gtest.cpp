@@ -36,7 +36,8 @@ using namespace std;
 template <typename I>
 using trcon_tuple = std::tuple<vector<I>, printable_char, printable_char, printable_char>;
 
-// each size_range vector is a {N, lda, singular}
+// each size_range vector is a {N, lda, singular}, or {N, lda, singular, 1} to run with the handle
+// in device pointer mode
 // if singular = 1, then the tests are also run with a matrix that has a zero diagonal element
 // (the estimate must be exactly zero if diag is non-unit)
 
@@ -67,7 +68,9 @@ const vector<vector<int>> matrix_size_range = {
     {7, 7, 1},
     {20, 25, 0},
     {33, 50, 1},
-    {100, 100, 0}};
+    {100, 100, 0},
+    // device pointer mode (with n large enough for rocBLAS to be called)
+    {500, 500, 0, 1}};
 
 const vector<vector<int64_t>> matrix_size_range_64 = {
     // quick return
@@ -80,7 +83,9 @@ const vector<vector<int64_t>> matrix_size_range_64 = {
     {7, 7, 1},
     {20, 25, 0},
     {33, 50, 1},
-    {100, 100, 0}};
+    {100, 100, 0},
+    // device pointer mode (with n large enough for rocBLAS to be called)
+    {500, 500, 0, 1}};
 
 // for daily_lapack tests
 const vector<vector<int>> large_matrix_size_range
@@ -106,6 +111,10 @@ Arguments trcon_setup_arguments(trcon_tuple<I> tup)
     arg.set<char>("diag", diag);
 
     arg.singular = (matrix_size[2] == 1) ? 1 : 0;
+
+    // device pointer mode
+    if(matrix_size.size() > 3 && matrix_size[3] == 1)
+        arg.set<char>("pointer_mode", 'D');
 
     arg.timing = 0;
 
